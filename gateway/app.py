@@ -1269,6 +1269,20 @@ def _local_subscription_endpoint_error(value: object) -> str:
     return ""
 
 
+def _local_subscription_token_rebind_error(provider: str, prior_provider: str,
+                                            cfg: dict, prior_cfg: dict) -> str:
+    """Refuse carrying a masked Dispatch token across an endpoint/provider boundary."""
+    local_now = provider == "local_subscription"
+    local_before = prior_provider == "local_subscription"
+    if not (local_now or local_before):
+        return ""
+    if provider != prior_provider:
+        return "local subscription changes require a freshly supplied Dispatch access token"
+    if local_now and str(cfg.get("base_url") or "") != str(prior_cfg.get("base_url") or ""):
+        return "changing a Dispatch MCP endpoint requires a freshly supplied Dispatch access token"
+    return ""
+
+
 def _auth_from_conn(conn: dict, sid: str = "", effort: str = "") -> dict | None:
     """What the SANDBOX is allowed to see, or None if it cannot be given anything safely.
 
@@ -5807,7 +5821,7 @@ _PROVIDER_CATALOG: dict[str, dict] = {
     # API. The secret scopes one Dispatch identity; the host retains all CLI
     # subscription credentials and selects a provider from fresh quota state.
     "local_subscription": {
-        "label": "HARU local subscription",
+        "label": "HARU local subscription (experimental)",
         "base_url": None,
         "fields": [{"key": "base_url", "label": "Dispatch MCP endpoint",
                     "placeholder": "https://dispatch.example.com/mcp"}],
@@ -6293,9 +6307,17 @@ async def admin_integrations_put(body: IntegrationsBody, request: Request) -> di
             raise HTTPException(400, f"integration needs a name and a known provider (got '{provider}')")
         cfg = {k: v for k, v in (i.get("config") or {}).items() if v not in (None, "")}
         # The client never sees secrets (sentinel) — carry stored values through unchanged edits.
-        prior_cfg = (stored.get(name) or {}).get("config") or {}
+        prior = stored.get(name) or {}
+        prior_cfg = prior.get("config") or {}
+        prior_provider = str(prior.get("provider") or "").lower()
         for k in _INTEGRATION_SECRET_FIELDS:
             if cfg.get(k) == _SECRET_SENTINEL:
+                # HARU FORK: a masked source token is reusable only for the
+                # same Dispatch endpoint and provider. Never retarget an old
+                # credential by editing a public config field in the same save.
+                rebinding = _local_subscription_token_rebind_error(provider, prior_provider, cfg, prior_cfg)
+                if rebinding:
+                    raise HTTPException(400, f"integration '{name}': {rebinding}")
                 if not prior_cfg.get(k):
                     raise HTTPException(400, f"integration '{name}': missing {k}")
                 cfg[k] = prior_cfg[k]
@@ -9063,6 +9085,15 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
     # HR-INF-010: the caller (create_response) already read this harness's vertex — thread it in
     # instead of re-reading it twice more here. Beyond cutting reads, a same-request snapshot means
     # _harness_plugins and agent_doc can't observe a mid-turn config edit inconsistently.
+    if backend == "herdr":
+        alias_error = _herdr_runtime_alias_error(hv)
+        if alias_error:
+            # Do this before _harness_env so an imported legacy record cannot
+            # resolve a vault/header reference into the Driver's checkpoint.
+            rec["status"] = "failed"
+            rec["error_message"] = alias_error
+            rec["tried"] = [{"connection": "", "status": "refused", "error": alias_error}]
+            return "failed", [], rec
     mcp_servers, skills, skills_suppressed, tools_disabled, plugin_pkgs = await _harness_plugins(harness_id, org, hdr_vals, hv=hv, sid=sid)
     turn_env, turn_secret = await _harness_env(hv, org, hdr_vals)
     if mcp_servers or skills or skills_suppressed or tools_disabled:
@@ -18572,7 +18603,7 @@ _BASE_CATALOG: dict[str, dict] = {
         # `ready` means this fork implements the adapter. It does not claim a
         # Mac host is online: its selectors remain unavailable until an explicit
         # local_subscription integration is configured.
-        "label": "HARU Herdr subscription", "backend": "herdr", "status": "ready",
+        "label": "HARU Herdr subscription (experimental)", "backend": "herdr", "status": "ready",
         "system_prompt": ("This task runs through HARU Dispatch in a visible Herdr pane using an "
                           "operator-owned subscription. Work only in the registered read-only project "
                           "selected by HARU; report actual observations and do not assume API credentials."),
@@ -19017,6 +19048,24 @@ _SKILL_INLINE_MAX = 48_000   # keep the vertex `skills` prop safely under the 64
 _HARU_WORKSPACE_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
+def _haru_workspace_alias(value: object) -> str | None:
+    """A literal registered alias, never a late-bound secret or request header."""
+    if not isinstance(value, str) or not _HARU_WORKSPACE_ALIAS.fullmatch(value):
+        return None
+    lowered = value.lower()
+    if lowered.startswith(("vault:", "secret:", "$headers.")):
+        return None
+    return value
+
+
+def _herdr_runtime_alias_error(harness: dict | None) -> str:
+    """Validate legacy/imported Herdr config before resolving any environment reference."""
+    env = _parse_env((harness or {}).get("env"))
+    if set(env) != {"HARU_WORKSPACE"} or _haru_workspace_alias(env.get("HARU_WORKSPACE")) is None:
+        return "Herdr requires HARU_WORKSPACE to be one literal registered project alias; secret and header references are not allowed."
+    return ""
+
+
 def _validate_herdr_harness(body: HarnessBody) -> None:
     """Keep the Console's manual Herdr setup inside the adapter's real boundary.
 
@@ -19033,7 +19082,7 @@ def _validate_herdr_harness(body: HarnessBody) -> None:
         "disabled_tools": body.disabled_tools, "additional_headers": body.additional_headers,
         "environment": body.environment, "calibrates": body.calibrates,
     }
-    if set(env) != {"HARU_WORKSPACE"} or not isinstance(alias, str) or not _HARU_WORKSPACE_ALIAS.fullmatch(alias):
+    if set(env) != {"HARU_WORKSPACE"} or _haru_workspace_alias(alias) is None:
         raise HTTPException(400, "Herdr requires HARU_WORKSPACE to be one registered project alias, never a path")
     if any(value for value in unsupported.values()):
         raise HTTPException(400, "Herdr does not support MCP servers, skills, plugins, tools, environments, headers, or calibration")

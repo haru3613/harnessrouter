@@ -37,6 +37,18 @@ def test_workspace_is_an_alias_not_a_host_path(tmp_path):
         hb.build_command('local_subscription',SimpleNamespace(api_key='t',base_url='https://x.test/mcp'),'haru-auto','x',str(tmp_path),{},workspace='/Users/private',request_key='r')
 
 
+@pytest.mark.parametrize('alias', ['vault:project-secret','secret:project-secret'])
+def test_workspace_references_cannot_reach_a_job_file(tmp_path, alias):
+    with pytest.raises(ValueError,match='workspace'):
+        hb.build_command('local_subscription',SimpleNamespace(api_key='t',base_url='https://x.test/mcp'),'haru-auto','x',str(tmp_path),{},workspace=alias,request_key='r')
+    assert not (tmp_path/'.harness').exists()
+
+
+def test_a_resolved_secret_annotation_is_rejected_even_when_value_looks_like_an_alias():
+    with pytest.raises(ValueError,match='literal'):
+        hb.validate_request(SimpleNamespace(env={'HARU_WORKSPACE':'looks-like-an-alias'},env_secret=['HARU_WORKSPACE']))
+
+
 @pytest.mark.parametrize('field,value',[('files',[{'filename':'x'}]),('mcp_servers',[{}]),('skills',[{}]),('plugins',[{}]),('tools_disabled',['Bash']),('environment_id','e'),('env',{'HOME':'x'})])
 def test_unsupported_features_rejected_before_dispatch(field,value):
     req=SimpleNamespace(env={'HARU_WORKSPACE':'fixture'})

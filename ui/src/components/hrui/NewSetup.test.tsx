@@ -12,8 +12,8 @@ const mockRun: { models: Record<string, string[]> } = { models: { 'claude-code':
 jest.mock('next/navigation', () => ({ useRouter: () => ({ prefetch: jest.fn(), push: jest.fn(), replace: jest.fn() }) }));
 jest.mock('@/lib/harness', () => ({
   createCustom: jest.fn(), listCustom: jest.fn(),
-  offeredOob: () => [{ id: 'claude-code', name: 'Claude Code' }, { id: 'hermes', name: 'Hermes' }, { id: 'herdr', name: 'HARU Herdr subscription' }],
-  oobById: (id: string) => ({ id, name: id === 'herdr' ? 'HARU Herdr subscription' : id }),
+  offeredOob: () => [{ id: 'claude-code', name: 'Claude Code' }, { id: 'hermes', name: 'Hermes' }, { id: 'herdr', name: 'HARU Herdr subscription (experimental)' }],
+  oobById: (id: string) => ({ id, name: id === 'herdr' ? 'HARU Herdr subscription (experimental)' : id }),
   oobDefaultModel: (id: string) => id === 'herdr' ? 'haru-auto' : 'claude-sonnet',
   useBasesRead: () => ({ value: { 'claude-code': {}, hermes: {}, herdr: { takesSkills: false } }, failed: false, retry: () => {} }),
   useModelCatalogRead: () => ({ value: { models: ['claude-sonnet'] }, failed: false, retry: () => {} }),
@@ -28,7 +28,7 @@ jest.mock('./start/open', () => ({ openNewSetup: jest.fn() }));
 jest.mock('./start/compose', () => ({ AUTO: 'auto' }));
 jest.mock('./start/demos', () => ({
   DEMOS: [{ from: 'Contract', to: 'risk review', short: 'Contract review', base: 'hermes', model: 'gpt-5.4', instr: 'Review this contract clause and list each risk.' }],
-  baseName: (id: string) => (id === 'hermes' ? 'Hermes' : id === 'herdr' ? 'HARU Herdr subscription' : id === 'auto' ? 'auto' : 'Claude Code'),
+  baseName: (id: string) => (id === 'hermes' ? 'Hermes' : id === 'herdr' ? 'HARU Herdr subscription (experimental)' : id === 'auto' ? 'auto' : 'Claude Code'),
   demoPick: () => ({ base: 'hermes', model: 'gpt-5.4' }), runnableModels: (b: string) => mockRun.models[b] || [],
 }));
 jest.mock('./start/Handoff', () => ({ Handoff: () => null }));

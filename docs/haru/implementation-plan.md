@@ -40,6 +40,13 @@ against an isolated fixture deployment before considering a cutover.
 
 ## Acceptance
 
+This is an experimental internal adapter, not an upstream verified harness base.
+The upstream five-scenario/model and custom-harness release matrix is deferred:
+v1 deliberately refuses artifact transfer, custom tools and skills. Catalog
+`ready` only means the adapter is implemented/selectable; its visible label must
+say experimental. No broader protocol/conformance or production cutover claim
+is permitted until those capability-specific gates are independently passed.
+
 - Test-first at new transport and routing seams; frequent focused tests/type checks.
 - Real Responses API -> Runner driver -> isolated HARU broker -> Mac Herdr pane ->
   subscription-backed Codex -> stored result. Verify existing production untouched,

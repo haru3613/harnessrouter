@@ -23,7 +23,7 @@ def _herdr_config(url: str = "https://dispatch.example.test/mcp") -> dict:
 
 def test_local_subscription_is_an_explicit_non_billed_provider_and_herdr_only():
     entry = gw._PROVIDER_CATALOG["local_subscription"]
-    assert entry["label"] == "HARU local subscription"
+    assert entry["label"] == "HARU local subscription (experimental)"
     assert entry["secret_label"] == "Dispatch access token"
     assert entry["base_url"] is None
     assert gw._INTEGRATION_WIRING[("local_subscription", "herdr")] == "local_subscription"
@@ -134,10 +134,20 @@ def test_herdr_harness_requires_an_alias_and_rejects_settings_the_host_cannot_en
     gw._validate_herdr_harness(good)
     with pytest.raises(HTTPException, match="registered project alias"):
         gw._validate_herdr_harness(gw.HarnessBody(name="Bad", base="herdr", env={"HARU_WORKSPACE": "/tmp/nope"}))
+    for reference in ("vault:dispatch-token", "secret:dispatch-token", "$headers.Project"):
+        with pytest.raises(HTTPException, match="registered project alias"):
+            gw._validate_herdr_harness(gw.HarnessBody(name="Bad", base="herdr", env={"HARU_WORKSPACE": reference}))
     with pytest.raises(HTTPException, match="does not support MCP"):
         gw._validate_herdr_harness(gw.HarnessBody(name="Bad", base="herdr",
                                                    env={"HARU_WORKSPACE": "dispatch-fixture"},
                                                    mcp_servers=[{"name": "x", "url": "https://x"}]))
+
+
+def test_legacy_herdr_reference_is_refused_before_environment_resolution():
+    assert "literal registered project alias" in gw._herdr_runtime_alias_error({
+        "env": '{"HARU_WORKSPACE":"vault:dispatch-token"}',
+    })
+    assert gw._herdr_runtime_alias_error({"env": '{"HARU_WORKSPACE":"dispatch-fixture"}'}) == ""
 
 
 def test_owner_trust_hands_only_dispatch_token_to_herdr(monkeypatch):
@@ -171,3 +181,31 @@ def test_integration_save_rejects_missing_or_bad_local_subscription_endpoint(mon
             "name": "empty", "provider": "local_subscription", "config": {"base_url": good["config"]["base_url"]},
         }]), object()))
 
+
+def test_masked_dispatch_token_cannot_be_rebound_to_another_endpoint_or_provider(monkeypatch):
+    writes = []
+
+    async def admin(_request):
+        return {"role": "owner"}
+    async def integrations():
+        return [{"name": "haru", "provider": "local_subscription", "config": {
+            "api_key": "old-dispatch-token", "base_url": "https://old.example.test/mcp",
+        }}]
+    async def vault_put(*args):
+        writes.append(args)
+        return True
+
+    monkeypatch.setattr(gw, "_require_integrations_admin", admin)
+    monkeypatch.setattr(gw, "_integrations_doc", integrations)
+    monkeypatch.setattr(gw, "_vault_put", vault_put)
+    with pytest.raises(HTTPException, match="freshly supplied Dispatch access token"):
+        asyncio.run(gw.admin_integrations_put(gw.IntegrationsBody(integrations=[{
+            "name": "haru", "provider": "local_subscription", "config": {
+                "api_key": gw._SECRET_SENTINEL, "base_url": "https://new.example.test/mcp",
+            },
+        }]), object()))
+    with pytest.raises(HTTPException, match="freshly supplied Dispatch access token"):
+        asyncio.run(gw.admin_integrations_put(gw.IntegrationsBody(integrations=[{
+            "name": "haru", "provider": "openai", "config": {"api_key": gw._SECRET_SENTINEL},
+        }]), object()))
+    assert writes == []

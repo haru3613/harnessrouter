@@ -24,17 +24,21 @@ def validate_request(req) -> None:
     env = getattr(req, 'env', None) or {}
     if not isinstance(env, dict) or set(env) - {'HARU_WORKSPACE'}:
         raise ValueError('Herdr accepts only HARU_WORKSPACE in harness environment settings')
+    if getattr(req, 'env_secret', None):
+        raise ValueError('HARU_WORKSPACE must be a literal alias, never a secret or header reference')
 
 
 def build_command(provider, auth, model, prompt, cwd, env, *, workspace, request_key,
                   resume_session_id=None, agent_doc='', timeout_seconds=600):
-    from herdr_driver import validate_endpoint
+    from herdr_driver import compose_task, validate_endpoint
     if provider != 'local_subscription':
         raise ValueError('Herdr requires local_subscription; API provider fallback is forbidden')
     if model not in MODELS:
         raise ValueError('Unknown Herdr subscription selector')
-    if not isinstance(workspace,str) or not _ALIAS.fullmatch(workspace):
+    if (not isinstance(workspace,str) or not _ALIAS.fullmatch(workspace) or
+            workspace.lower().startswith(('vault:', 'secret:'))):
         raise ValueError('HARU_WORKSPACE must be a registered workspace alias, never a path')
+    compose_task(prompt, agent_doc or '')  # validate the combined host limit before persistence
     token = getattr(auth, 'api_key', None)
     if not isinstance(token,str) or not token.strip():
         raise ValueError('A scoped Dispatch access token is required')

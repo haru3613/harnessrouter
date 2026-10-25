@@ -1,9 +1,13 @@
-# HARU fork: Herdr + local subscriptions
+# HARU fork: experimental Herdr + local subscriptions
 
 This fork adds an opt-in `herdr` execution backend to HarnessRouter. It delegates
 read-only work to an existing HARU Dispatch host, where Codex/Claude subscriptions,
 quota admission, registered projects and Herdr pane ownership remain authoritative.
 It does not configure a paid model API or replace an existing Dispatch deployment.
+
+This is an experimental internal adapter. It has not passed the upstream full
+five-scenario/model and custom-harness support matrix. Its visible experimental
+label is intentional; file/skill/tool scenarios are explicitly unsupported.
 
 ## What works in this first slice
 

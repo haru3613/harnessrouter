@@ -202,7 +202,7 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
     if (herdr) {
       try {
         const saved = await createCustom({
-          name: setupName.trim(), base: 'herdr', baseLabel: 'HARU Herdr subscription',
+          name: setupName.trim(), base: 'herdr', baseLabel: 'HARU Herdr subscription (experimental)',
           defaultModel: mAuto ? 'haru-auto' : m, systemPrompt: j,
           env: { HARU_WORKSPACE: workspaceAlias.trim() },
         });

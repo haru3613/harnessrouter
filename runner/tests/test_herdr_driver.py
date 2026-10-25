@@ -4,6 +4,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from urllib import error
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import herdr_driver as hd  # noqa: E402
@@ -118,6 +119,15 @@ class HerdrDriverTests(unittest.TestCase):
         first.close()
         self.turn().close()
 
+    def test_composed_task_boundary_is_checked_before_state_or_network(self):
+        exact_prompt = "界" * 5458 + "x"  # 16375 bytes; doc plus separator is exactly 16384.
+        self.assertEqual(len(hd.compose_task(exact_prompt, "a").encode()), 16384)
+        with self.assertRaisesRegex(hd.DriverError, "exceeds"):
+            hd.compose_task(exact_prompt + "x", "a")
+        with self.assertRaises(hd.DriverError):
+            self.turn(self.job(prompt=exact_prompt + "x", agent_doc="a"))
+        self.assertFalse((self.cwd / ".harness").exists())
+
     def test_mcp_content_parser_refuses_error_and_accepts_structured(self):
         self.assertEqual(hd._content_result({"result": {"structuredContent": {"task": {}}}}), {"task": {}})
         with self.assertRaises(hd.DriverError): hd._content_result({"error": {"message": "secret"}})
@@ -176,6 +186,26 @@ class HerdrDriverTests(unittest.TestCase):
         turn.run()
         self.assertEqual(events[-1][1]["status"], "incomplete")
         self.assertEqual(events[-1][1]["reason"], "remote_outcome_unknown")
+
+    def test_explicit_http_auth_rejection_is_safe_failure_not_unknown(self):
+        class RejectingOpener:
+            def __init__(self, code):
+                self.code = code
+            def open(self, req, timeout):
+                raise error.HTTPError(req.full_url, self.code, "no", {}, None)
+        for code in (401, 403):
+            client = hd.MCPClient("https://dispatch.example/mcp", "token", opener=RejectingOpener(code))
+            with self.subTest(code=code), self.assertRaises(hd.AuthenticationError):
+                client.call("submit_session_task", {})
+
+        class RejectingClient(FakeClient):
+            def call(self, name, args):
+                raise hd.AuthenticationError("HARU access was rejected")
+        events = []
+        turn = hd.Turn(self.job(request_id="rejected"), environ=self.env, client_factory=RejectingClient,
+                       emit=lambda m, p: events.append((m, p)), now=lambda: 0, sleep=lambda _: None)
+        turn.run()
+        self.assertEqual(events[-1][1]["status"], "failed")
 
     def test_cancel_before_submit_is_unknown_after_durable_intent(self):
         turn = self.turn()

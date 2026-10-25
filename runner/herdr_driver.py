@@ -51,6 +51,10 @@ class TransportError(RuntimeError):
     """The host may have received an idempotent request but did not answer."""
 
 
+class AuthenticationError(DriverError):
+    """An HTTP auth boundary rejected the request before it reached an MCP tool."""
+
+
 def _emit(method: str, payload: Mapping[str, Any]) -> None:
     sys.stdout.write(json.dumps({"m": method, "p": dict(payload)}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
@@ -75,6 +79,17 @@ def _text(value: Any, label: str, maximum: int) -> str:
     if not isinstance(value, str) or not value.strip() or "\x00" in value or len(value.encode()) > maximum:
         raise DriverError(f"invalid {label}")
     return value
+
+
+def compose_task(prompt: Any, agent_doc: Any) -> str:
+    """Build the only prompt HARU receives and enforce its final byte limit early."""
+    prompt_text = _text(prompt, "prompt", 16 * 1024)
+    if not isinstance(agent_doc, str) or "\x00" in agent_doc or len(agent_doc.encode()) > 64 * 1024:
+        raise DriverError("invalid agent instructions")
+    task = prompt_text if not agent_doc else agent_doc.strip() + "\n\nTask:\n" + prompt_text
+    if len(task.encode()) > 16 * 1024:
+        raise DriverError("HARU task including instructions exceeds 16384 bytes")
+    return task
 
 
 def _state_directory(cwd: Path) -> Path:
@@ -221,7 +236,14 @@ class MCPClient:
                 if response.status != 200:
                     raise TransportError("HARU MCP request failed")
                 raw = response.read(MAX_BODY + 1)
-        except (error.URLError, error.HTTPError, OSError) as exc:
+        except error.HTTPError as exc:
+            # An HTTP auth challenge is generated before an MCP tool is
+            # dispatched. Other HTTP failures may be after an intermediary
+            # accepted/proxied a request, so preserve their uncertain outcome.
+            if exc.code in {401, 403}:
+                raise AuthenticationError("HARU access was rejected") from exc
+            raise TransportError("HARU MCP did not answer") from exc
+        except (error.URLError, OSError) as exc:
             raise TransportError("HARU MCP did not answer") from exc
         if len(raw) > MAX_BODY:
             raise DriverError("HARU MCP response is oversized")
@@ -258,10 +280,8 @@ def _job(job: Mapping[str, Any], environ: Mapping[str, str]) -> tuple[dict[str, 
     model = job.get("model", "haru-auto")
     if model not in _MODELS:
         raise DriverError("invalid local subscription model")
-    prompt = _text(job.get("prompt"), "prompt", 16 * 1024)
+    prompt = job.get("prompt")
     agent_doc = job.get("agent_doc") or ""
-    if not isinstance(agent_doc, str) or len(agent_doc.encode()) > 64 * 1024:
-        raise DriverError("invalid agent instructions")
     endpoint = validate_endpoint(job.get("base_url"))
     token = _text(environ.get("HR_HERDR_TOKEN"), "HARU access token", 4096)
     timeout = job.get("timeout_seconds", 600)
@@ -270,7 +290,7 @@ def _job(job: Mapping[str, Any], environ: Mapping[str, str]) -> tuple[dict[str, 
     resume = job.get("resume_session_id") or ""
     if resume and (not isinstance(resume, str) or not resume.startswith("haru:") or not _ID.fullmatch(resume[5:])):
         raise DriverError("invalid HARU continuation id")
-    task = prompt if not agent_doc else agent_doc.strip() + "\n\nTask:\n" + prompt
+    task = compose_task(prompt, agent_doc)
     payload: dict[str, Any] = {"task": task, "workspace": workspace, "request_id": request_id,
                                "mode": "analysis", "result_contract": "evidence_required"}
     provider = _MODELS[model]
@@ -429,7 +449,7 @@ class Turn:
                 if state != last:
                     self.emit("notice", {"text": "HARU task state: " + "/".join(str(v or "-") for v in state)})
                     last = state
-                    outcome = self._outcome(task, self.token)
+                outcome = self._outcome(task, self.token)
                 if outcome is not None:
                     status, reason = outcome
                     final = _safe_output(task.get("result"), self.token)
@@ -451,6 +471,9 @@ class Turn:
             self.emit("__hr_result", {"status": "incomplete", "reason": "remote_outcome_unknown", "final": "",
                                         "session_id": "haru:" + str(self.state.get("task_id") or ""),
                                         "remote": {"execution_state": "unknown"}})
+            return 0
+        except AuthenticationError as exc:
+            self.emit("__hr_result", {"status": "failed", "reason": str(exc), "final": "", "session_id": ""})
             return 0
         except DriverError as exc:
             if self.state.get("submission_attempted") or self.state.get("task_id"):
@@ -498,6 +521,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         reason = turn.cancel() if turn else "remote_stop_unknown"
         _emit("__hr_result", {"status": "incomplete", "reason": reason, "final": "", "session_id": ""})
+        return 0
+    except AuthenticationError as exc:
+        _emit("__hr_result", {"status": "failed", "reason": str(exc), "final": "", "session_id": ""})
         return 0
     except (DriverError, TransportError) as exc:
         _emit("__hr_result", {"status": "failed", "reason": str(exc), "final": "", "session_id": ""})
