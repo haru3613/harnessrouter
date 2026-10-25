@@ -46,7 +46,11 @@ def _bases_in_dimension() -> list:
 
 # The driver's own exclusion: a System One model chooses among offered actions and runs no shell, so
 # the fixture's script has nothing to run on it.
-EXCLUDED = {"systemone"}
+# HARU Herdr is intentionally outside this upstream tool-disable matrix: it
+# advertises no generic tools and rejects the matrix fixture's skills/MCP/files
+# before any remote task is submitted. Its dedicated adapter suite validates
+# that narrower read-only contract instead.
+EXCLUDED = {"systemone", "herdr"}
 
 
 def _tool_ids(spec: dict) -> list:

@@ -58,7 +58,9 @@ def test_the_console_is_told_the_base_takes_no_environment(monkeypatch):
     monkeypatch.setattr(gw, "_servable_models", servable)
     bases = {b["id"]: b for b in asyncio.run(gw.list_bases(None))["bases"]}
     assert bases["qoder"]["takesEnvironments"] is False
-    assert all(b["takesEnvironments"] is True for k, b in bases.items() if k != "qoder")
+    # HARU's remote Herdr adapter also deliberately refuses container
+    # environments: it receives only a registered Dispatch workspace alias.
+    assert all(b["takesEnvironments"] is True for k, b in bases.items() if k not in {"qoder", "herdr"})
 
 
 def test_one_provider_its_own_and_nothing_else_drives_it():

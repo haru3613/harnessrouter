@@ -1,0 +1,77 @@
+"""HARU fork: only the dedicated subscription route may launch the host driver."""
+import json
+import pathlib
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import herdr_backend as hb
+
+
+def test_builder_keeps_token_out_of_job_and_argv_and_binds_idempotency(tmp_path):
+    env = {}
+    args = dict(provider='local_subscription', auth=SimpleNamespace(api_key='secret-source-token',base_url='https://dispatch.example/mcp'),
+                model='haru-codex',prompt='Read a fact',cwd=str(tmp_path),env=env,
+                workspace='fixture',request_key='response-1',agent_doc='Only read',timeout_seconds=60)
+    cmd = hb.build_command(**args)
+    job = json.loads(pathlib.Path(cmd[-1]).read_text())
+    assert env['HR_HERDR_TOKEN']=='secret-source-token'
+    assert 'secret-source-token' not in json.dumps(cmd)+json.dumps(job)
+    assert job['workspace']=='fixture' and job['model']=='haru-codex'
+    assert pathlib.Path(cmd[-1]).stat().st_mode & 0o777 == 0o600
+    assert hb.build_command(**args)==cmd
+    with pytest.raises(ValueError,match='different'):
+        hb.build_command(**{**args,'prompt':'a different operation'})
+
+
+@pytest.mark.parametrize('provider,model', [('openai','haru-codex'),('anthropic','haru-claude'),('local_subscription','gpt-any')])
+def test_no_paid_or_unknown_route(provider,model,tmp_path):
+    with pytest.raises(ValueError):
+        hb.build_command(provider,SimpleNamespace(api_key='t',base_url='https://x.test/mcp'),model,'x',str(tmp_path),{},workspace='fixture',request_key='r')
+
+
+def test_workspace_is_an_alias_not_a_host_path(tmp_path):
+    with pytest.raises(ValueError,match='workspace'):
+        hb.build_command('local_subscription',SimpleNamespace(api_key='t',base_url='https://x.test/mcp'),'haru-auto','x',str(tmp_path),{},workspace='/Users/private',request_key='r')
+
+
+@pytest.mark.parametrize('field,value',[('files',[{'filename':'x'}]),('mcp_servers',[{}]),('skills',[{}]),('plugins',[{}]),('tools_disabled',['Bash']),('environment_id','e'),('env',{'HOME':'x'})])
+def test_unsupported_features_rejected_before_dispatch(field,value):
+    req=SimpleNamespace(env={'HARU_WORKSPACE':'fixture'})
+    setattr(req,field,value)
+    with pytest.raises(ValueError):hb.validate_request(req)
+
+
+def test_events_distinguish_progress_result_and_unknown_stop():
+    state={}
+    assert hb.normalize({'m':'__hr_init','p':{'session_id':'haru:one'}},state)[0]['session_id']=='haru:one'
+    notice=hb.normalize({'m':'notice','p':{'text':'Host queued'}},state)[0]
+    assert notice['type']=='system' and notice['subtype']=='notice'
+    result=hb.normalize({'m':'__hr_result','p':{'status':'completed','final':'done','remote':{'return_state':'waiting_origin','resource_state':'cleanup_pending'}}},state)[0]
+    assert result['subtype']=='success' and result['result']=='done'
+    assert state['remote']['return_state']=='waiting_origin'
+    stopped=hb.normalize({'m':'__hr_result','p':{'status':'incomplete','reason':'stop_unknown','final':'Remote stop not verified'}},{})[0]
+    assert stopped['subtype']=='incomplete' and not stopped['is_error']
+    assert 'may still be running' in hb.normalize.eof({},1)[0]['result']
+
+
+def test_runner_registry_and_unsupported_input_refusal(monkeypatch,tmp_path):
+    import server as rs
+    from fastapi.testclient import TestClient
+    assert rs.BACKENDS['herdr']['providers']==['local_subscription']
+    assert rs.BACKENDS['herdr']['remote'] is True
+    # Upstream defaults this *capability hint* true even on text-only requests;
+    # actual input files/image credentials, rather than this hint, are refused.
+    hb.validate_request(rs.TurnReq(backend='herdr',prompt='read',env={'HARU_WORKSPACE':'fixture'}))
+    monkeypatch.setattr(rs,'_SESSION_UIDS',False)
+    monkeypatch.setattr(rs,'WORKSPACE_ROOT',str(tmp_path/'workspaces'))
+    with TestClient(rs.app) as client:
+        response=client.post('/turn?identifier=herdr-test',json={
+            'backend':'herdr','provider':'local_subscription','model':'haru-codex',
+            'prompt':'Read a fact','files':[{'filename':'x','content_b64':'eA=='}],
+            'env':{'HARU_WORKSPACE':'fixture'}})
+    assert response.status_code==400
+    assert 'no remote task was submitted' in response.json()['detail']
+    assert not (tmp_path/'workspaces').exists()

@@ -1,0 +1,26 @@
+# HARU fork: independent localhost-only instance; never mount the Mac HOME or repos.
+services:
+  harnessrouter:
+    build:
+      context: .
+      args:
+        WITH_STARTER_KITS: "0"
+        WITH_BUILTIN_SKILLS: "0"
+        WITH_DOC_PREVIEW: "0"
+        WITH_MEDIA: "0"
+        HR_VERSION: haru-herdr-dev
+    image: haru-harnessrouter:local
+    ports:
+      - "127.0.0.1:${HARU_CONSOLE_PORT:-3100}:3000"
+    environment:
+      HR_BACKENDS: herdr
+      HR_SANDBOX_TRUST: owner
+      HR_AUTH_USER: ${HARU_CONSOLE_USER:-haru}
+      HR_AUTH_PASSWORD: ${HARU_CONSOLE_PASSWORD:?Set a private Console password}
+      HR_SECRET_KEY: ${HARU_SECRET_KEY:?Set a local encryption secret}
+      HR_BROKER_IMAGES: "0"
+    volumes:
+      - haru-harnessrouter-data:/data
+    restart: unless-stopped
+volumes:
+  haru-harnessrouter-data:

@@ -63,6 +63,15 @@ test('no harness is offered until the server lists it, and only the ones it list
   expect(one.map((o) => o.id)).toEqual(['hermes']);
 });
 
+test('the configured-only Herdr adapter is selectable once the server lists its base', () => {
+  const h = fresh();
+  const herdr = h.oobById('herdr');
+  expect(herdr?.backend).toBe('herdr');
+  expect(herdr?.models).toEqual(['haru-auto', 'haru-codex', 'haru-claude']);
+  const bases = { herdr: { id: 'herdr', backend: 'herdr', models: [] } as unknown as import('./harness').BaseInfo };
+  expect(h.offeredOob(bases).map((o) => o.id)).toEqual(['herdr']);
+});
+
 test('a setup saved with no model of its own keeps none, whatever the catalog says', async () => {
   const h = fresh();
   hf.mockResolvedValueOnce(json(MODELS));

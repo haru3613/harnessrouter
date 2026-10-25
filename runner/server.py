@@ -85,6 +85,8 @@ from pydantic import BaseModel
 import environments   # the read-only project layer a turn may name (runner/environments.py)
 import reasoning      # how much a model thinks on a turn: levels and what sets them (runner/reasoning.py)
 import tracecontext   # the caller's W3C trace context: its checks and a child for the relay (#473)
+# HARU fork: explicit remote subscription backend; upstream runtimes are unchanged.
+import herdr_backend
 
 app = FastAPI(title="harness-runner")
 
@@ -11632,6 +11634,9 @@ _agentzero_to_claude.eof = _agentzero_eof   # type: ignore[attr-defined]
 
 
 BACKENDS = {
+    "herdr": {"providers": sorted(herdr_backend.PROVIDERS),
+              "default_model": herdr_backend.DEFAULT_MODEL,
+              "normalize": herdr_backend.normalize, "remote": True},
     "claude": {"providers": sorted(CLAUDE_PROVIDERS), "default_model": CLAUDE_DEFAULT_MODEL,
                "normalize": _claude_passthrough},
     "codex": {"providers": sorted(CODEX_PROVIDERS), "default_model": CODEX_DEFAULT_MODEL,
@@ -13642,6 +13647,11 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
     spec = BACKENDS.get(backend)
     if not spec:
         raise HTTPException(400, f"unknown backend '{backend}' (one of {sorted(BACKENDS)})")
+    if backend == "herdr":
+        try:
+            herdr_backend.validate_request(req)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
     cwd = req.cwd or _ws(identifier)
     if _SESSION_UIDS and req.cwd and os.path.realpath(req.cwd) != os.path.realpath(_ws(identifier)):
         # Behind the wall the directory decides which uid a turn runs as; a caller-chosen one
@@ -13874,6 +13884,18 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
                                resume_session_id=req.resume_session_id,
                                mcp_servers=req.mcp_servers,
                                tools_disabled=req.tools_disabled, max_turns=req.max_turns)
+    elif backend == "herdr":
+        model = model or herdr_backend.DEFAULT_MODEL
+        try:
+            cmd = herdr_backend.build_command(
+                req.provider, auth, model, req.prompt, cwd, env,
+                workspace=(req.env or {}).get("HARU_WORKSPACE"),
+                request_key=identifier + ":" + (key or uuid.uuid4().hex),
+                resume_session_id=req.resume_session_id,
+                agent_doc=agent_doc, timeout_seconds=req.timeout_seconds or 600,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
     elif backend == "qoder":
         model = model or QODER_DEFAULT_MODEL
         # The agent doc becomes the remote Agent's system prompt; the skill folders _write_skills

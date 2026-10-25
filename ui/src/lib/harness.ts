@@ -23,7 +23,7 @@ export interface OobHarness {
   defaultModel?: string;   // the backend default, NOT necessarily models[0]
   moreModels?: number;     // "+N" pill
   status: 'ready' | 'soon';
-  backend: 'claude' | 'codex' | 'hermes' | 'pi' | 'dsh' | 'opencode' | 'kilo' | 'qwen' | 'gemini' | 'cline' | 'omp' | 'goose' | 'kimi' | 'minimax' | 'aider' | 'openhands' | 'grok' | 'systemone' | 'cheetahclaws' | 'agentzero' | 'mimo' | 'jcode' | 'opensquilla' | 'nanobot' | 'zeroclaw' | 'qoder' | null; // gateway backend; null = coming soon
+  backend: 'claude' | 'codex' | 'hermes' | 'pi' | 'dsh' | 'opencode' | 'kilo' | 'qwen' | 'gemini' | 'cline' | 'omp' | 'goose' | 'kimi' | 'minimax' | 'aider' | 'openhands' | 'grok' | 'systemone' | 'cheetahclaws' | 'agentzero' | 'mimo' | 'jcode' | 'opensquilla' | 'nanobot' | 'zeroclaw' | 'qoder' | 'herdr' | null; // gateway backend; null = coming soon
   systemPrompt: string;    // the harness's built-in system prompt (shown read-only)
   tools: string[];         // built-in tools (read-only)
   skills: string[];        // built-in skills (read-only)
@@ -227,6 +227,10 @@ export const OOB: OobHarness[] = [
     models: ['auto', 'ultimate', 'performance', 'smodel', 'qmodel_38max', 'qmodel', 'kmodel_latest', 'gmodel', 'gfmodel', 'dmodel', 'dfmodel', 'mmodel'], defaultModel: 'ultimate', moreModels: 0,
     systemPrompt: 'You are Qoder, an autonomous coding agent running in a cloud sandbox with shell and file access. Read, edit and run what the task needs, and deliver every file the user should receive with DeliverArtifacts.',
     tools: ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'ImageSearch', 'ImageGen', 'DeliverArtifacts'], skills: [] },
+  { id: 'herdr', name: 'HARU Herdr subscription', version: 'Local subscription adapter', backend: 'herdr', status: 'ready',
+    models: ['haru-auto', 'haru-codex', 'haru-claude'], defaultModel: 'haru-auto', moreModels: 0,
+    systemPrompt: 'Runs a read-only task through a configured HARU Dispatch endpoint in a visible Herdr pane. Configure a scoped Dispatch access token and MCP endpoint before use; the Mac host selects an already-authenticated subscription and reports its actual state.',
+    tools: [], skills: [] },
   { id: 'mimo', name: 'MiMo Code', version: 'v0.1.15', backend: 'mimo', status: 'ready',
     // Placeholder only, like every list above: the gateway's catalog wins once fetched. MiMo Code is
     // an opencode fork and reaches what opencode reaches, so the list is opencode's.
