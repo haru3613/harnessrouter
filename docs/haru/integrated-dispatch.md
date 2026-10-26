@@ -17,7 +17,8 @@ identities, tokens, task IDs, return capabilities and read-only limits survive.
   committed to this public fork. The image records its source revision and the
   artifact hash; no private layer is pushed to a public registry or cache.
 - A HarnessRouter-owned volume holds the imported broker SQLite databases and
-  capability/signing keys. A migration-complete manifest is checked read-only
+  capability/signing keys. Import atomically promotes `current/` inside that
+  volume, and runtime opens `/state/current`. A migration-complete manifest is checked read-only
   before any compatibility constructor; missing or inconsistent state fails
   closed rather than creating a new identity. Secret values are supplied only
   to source-gateway and the tunnel credential only to the new tunnel service.

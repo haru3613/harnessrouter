@@ -85,7 +85,7 @@ def test_tunnel_and_router_are_fenced_onto_separate_networks() -> None:
 def test_source_gateway_has_the_required_runtime_confinement() -> None:
     source = _compose()["services"]["source-gateway"]
 
-    assert source["environment"]["HARU_DISPATCH_STATE_DIR"] == "/state"
+    assert source["environment"]["HARU_DISPATCH_STATE_DIR"] == "/state/current"
     assert source["user"] == "501:10001"
     assert source["read_only"] is True
     assert source["cap_drop"] == ["ALL"]

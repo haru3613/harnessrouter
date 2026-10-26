@@ -54,7 +54,8 @@ services:
       - grok_token
       - router_api_key
     environment:
-      HARU_DISPATCH_STATE_DIR: /state
+      # Import atomically promotes a directory inside the mounted volume.
+      HARU_DISPATCH_STATE_DIR: /state/current
       HARU_RUNTIME_CONFIG: /run/config/config.json
       HR_DISPATCH_COMPAT_ROOT: /app/compat
       HR_DISPATCH_SOURCE_REVISION: ${HR_DISPATCH_SOURCE_REVISION:?Set the pinned dispatch source revision}
