@@ -13,7 +13,12 @@ data/
 *.key
 
 node_modules/
+**/node_modules/
+.venv*/
+**/.venv*/
+.worktrees/
 .next/
+**/.next/
 dist/
 __pycache__/
 *.pyc

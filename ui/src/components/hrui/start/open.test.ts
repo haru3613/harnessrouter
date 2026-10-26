@@ -70,7 +70,12 @@ describe('after any create, the only destination is that setup’s Tasks', () =>
   test('New setup’s Save opens the page of the setup being made, and that page the setup’s own', () => {
     const sheet = ALL.filter((l) => l.file === 'components/hrui/NewSetup.tsx');
     expect(sheet.some((l) => /const b = startBuild\(/.test(l.text))).toBe(true);
-    expect(sheet.filter((l) => /\bopenNewSetup\(/.test(l.text)).map((l) => l.text.trim())).toEqual(['openNewSetup(router, { build: b.key });']);
+    // HARU fork: manual subscription setup opens its saved id; other bases keep
+    // the builder page. Both use the same destination helper, never a fallback.
+    expect(sheet.filter((l) => /\bopenNewSetup\(/.test(l.text)).map((l) => l.text.trim())).toEqual([
+      'openNewSetup(router, { id: saved.id });',
+      'openNewSetup(router, { build: b.key });',
+    ]);
   });
   test('the page of a setup being made opens the setup and nothing else, whatever happened before it loaded', () => {
     const page = ALL.filter((l) => l.file === 'components/hrui/start/BuildPage.tsx');

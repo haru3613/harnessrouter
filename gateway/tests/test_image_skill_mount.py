@@ -62,5 +62,7 @@ def test_the_media_server_is_known_by_its_own_path_whatever_it_was_named():
 
 def test_the_turn_applies_it_right_after_its_image_credential_is_read():
     src = (Path(__file__).resolve().parents[1] / "app.py").read_text()
-    assert ("    image_auth = await _image_auth(sid, backend)\n"
+    # HARU's local-subscription adapter deliberately receives no auxiliary
+    # image credential; the shared helper keeps the ordinary ordering intact.
+    assert ("    image_auth, vision_auth = await _turn_auxiliary_media_auth(sid, backend)\n"
             "    skills, skills_suppressed = _without_shadowing_image_skill(skills, skills_suppressed, image_auth, mcp_servers)\n") in src

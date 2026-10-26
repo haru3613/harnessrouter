@@ -1,3 +1,8 @@
+> **HARU fork:** opt-in Herdr execution through existing Mac subscriptions, with
+> read-only project admission and no model API fallback. See the
+> [HARU setup and verification guide](docs/haru/README.md). Upstream interfaces
+> remain available; this does not migrate an existing Dispatch deployment.
+
 <h1 align="center">
   <a href="https://harnessrouter.ai/open-source#gh-light-mode-only">
     <img alt="HarnessRouter" src=".github/images/logo-light.png" width="280">

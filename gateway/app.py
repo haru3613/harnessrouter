@@ -1102,7 +1102,10 @@ _NATIVE_ONLY_BACKENDS = {"gemini",
                          # qoder: the driver speaks Qoder's own control API (sessions, events, files),
                          # which the broker's model doors do not carry; the runner's loopback relay is
                          # its credential boundary, and that needs the connection's key on the box
-                         "qoder"}
+                         "qoder",
+                         # HARU FORK: this is a scoped Dispatch source token, not a model
+                         # credential.  It must never be brokered or silently substituted.
+                         "herdr"}
 
 
 # ── A harness that drives another harness ─────────────────────────────────────────────────────
@@ -1243,6 +1246,43 @@ _SECRET_AUTH_FIELDS = ("api_key", "aws_access_key_id", "aws_secret_access_key",
 SANDBOX_TRUST = os.environ.get("HR_SANDBOX_TRUST", "").strip().lower()
 
 
+def _local_subscription_endpoint_error(value: object) -> str:
+    """Validate the one scoped Dispatch endpoint accepted by the Herdr driver.
+
+    This is deliberately narrower than a generic model-provider base URL: the
+    driver speaks MCP JSON-RPC at exactly `/mcp`, never follows redirects, and
+    receives no host filesystem path or subscription credential.
+    """
+    if not isinstance(value, str) or not value or value != value.strip():
+        return "a Dispatch MCP endpoint is required"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+    except ValueError:
+        return "Dispatch MCP endpoint is not a valid URL"
+    host = (parsed.hostname or "").lower()
+    loopback = host in {"localhost", "127.0.0.1", "::1"}
+    if (parsed.scheme not in {"https", "http"} or not host or parsed.path != "/mcp" or
+            parsed.query or parsed.fragment or parsed.username or parsed.password):
+        return "Dispatch MCP endpoint must be an HTTP(S) /mcp URL without credentials, query, or fragment"
+    if parsed.scheme == "http" and not loopback:
+        return "Dispatch MCP endpoint must use HTTPS outside localhost"
+    return ""
+
+
+def _local_subscription_token_rebind_error(provider: str, prior_provider: str,
+                                            cfg: dict, prior_cfg: dict) -> str:
+    """Refuse carrying a masked Dispatch token across an endpoint/provider boundary."""
+    local_now = provider == "local_subscription"
+    local_before = prior_provider == "local_subscription"
+    if not (local_now or local_before):
+        return ""
+    if provider != prior_provider:
+        return "local subscription changes require a freshly supplied Dispatch access token"
+    if local_now and str(cfg.get("base_url") or "") != str(prior_cfg.get("base_url") or ""):
+        return "changing a Dispatch MCP endpoint requires a freshly supplied Dispatch access token"
+    return ""
+
+
 def _auth_from_conn(conn: dict, sid: str = "", effort: str = "") -> dict | None:
     """What the SANDBOX is allowed to see, or None if it cannot be given anything safely.
 
@@ -1258,6 +1298,16 @@ def _auth_from_conn(conn: dict, sid: str = "", effort: str = "") -> dict | None:
     out = {k: conn[k] for k in _AUTH_FIELDS if conn.get(k) is not None}
     for secret in _SECRET_AUTH_FIELDS:
         out.pop(secret, None)
+    provider = str(conn.get("provider") or "").strip().lower()
+    if provider == "local_subscription":
+        if _local_subscription_endpoint_error(out.get("base_url")) or not conn.get("api_key"):
+            return None
+        # This token scopes HARU's own source identity. It is not a provider
+        # API key, so there is no broker or fallback route for it.
+        if SANDBOX_TRUST != "owner":
+            print("[haru] refusing local_subscription outside HR_SANDBOX_TRUST=owner", flush=True)
+            return None
+        return {"base_url": str(out["base_url"]), "api_key": str(conn["api_key"])}
     # The same base the broker would forward to: an Azure endpoint pasted bare from the portal
     # gains its /openai/v1 here as well, because in owner trust the sandbox talks to the provider
     # with this base directly and a bare one 404s on every tool call ("Resource not found", the
@@ -1292,7 +1342,6 @@ def _auth_from_conn(conn: dict, sid: str = "", effort: str = "") -> dict | None:
               f"provider's native API, which is not brokered (HR_SANDBOX_TRUST=owner runs it)", flush=True)
         return None
     # Normalised: a connection saved as "TokenRouter" must not skip brokering on a casing mismatch.
-    provider = str(conn.get("provider") or "").strip().lower()
     # Where the sandbox reaches the broker: this gateway's own door beside a local runner, else the
     # public base (see _sandbox_broker_origin). A self-hosted instance has the first without ever
     # setting the second, and an Entra connection there is brokered all the same.
@@ -1481,6 +1530,9 @@ _INTEGRATION_WIRING: dict[tuple[str, str], str] = {
     # qoder runs on Qoder's own hosted runtime and bills through Qoder's model access: a connection
     # carries a Qoder PAT or SAT and nothing else drives it, so the one pair is its own provider.
     ("qoder", "qoder"): "qoder",
+    # HARU FORK: the Mac host chooses its already-authenticated Codex/Claude
+    # subscription. No provider API connection can drive this backend.
+    ("local_subscription", "herdr"): "local_subscription",
     ("tokenrouter", "openhands"): "tokenrouter", ("vercel", "openhands"): "tokenrouter",
     ("llmtr", "openhands"): "tokenrouter",
     ("custom", "openhands"): "openai-api",
@@ -5248,7 +5300,19 @@ async def cancel_session(sid: str, request: Request) -> dict:
         return {"session_id": sid, "status": str(v.get("status") or ""), "cancelled": False,
                 "detail": "no running turn"}
     killed, rid = await _stop_session(org, sid, v)
-    return {"session_id": sid, "status": "cancelled", "cancelled": True, "runner_killed": killed}
+    out = {"session_id": sid, "status": "cancelled", "cancelled": True, "runner_killed": killed}
+    if _haru_host_stop_unverified(v):
+        # The local Runner only confirms delivery to the Herdr driver. HARU's
+        # host may still have an escaped child; source-facing callers must not
+        # mistake this logical cancellation for a physical-stop guarantee.
+        out["host_stop_status"] = "unverified"
+        out["host_stop_detail"] = "Cancellation was requested from HARU; Mac process termination is not verified."
+    return out
+
+
+def _haru_host_stop_unverified(vertex: dict | None) -> bool:
+    """Whether this cancellation crosses from the runner to a Mac host."""
+    return str((vertex or {}).get("backend") or "").strip().lower() == "herdr"
 
 
 async def _stop_session(org: str, sid: str, v: dict, rid_hint: str = "") -> tuple[bool, str]:
@@ -5302,6 +5366,13 @@ async def _stop_session(org: str, sid: str, v: dict, rid_hint: str = "") -> tupl
             rec = await _resp_get(rid)
             if rec and str(rec.get("status") or "") in ("running", "in_progress", "queued", "starting"):
                 rec["status"] = "cancelled"
+                if _haru_host_stop_unverified(v):
+                    metadata = dict(rec.get("metadata") or {})
+                    metadata["haru_stop"] = "unverified"
+                    metadata["haru_stop_detail"] = (
+                        "Cancellation was requested from HARU; Mac process termination is not verified."
+                    )
+                    rec["metadata"] = metadata
                 rec.setdefault("_completed_at", time.time())     # the turns feed's completed_at
                 _resp_cache_forget(rid)
                 await _blob_put(f"responses/{rid}.json", json.dumps(rec, default=str).encode(), kb=RESP_BLOB_KB)
@@ -5745,6 +5816,18 @@ _PROVIDER_CATALOG: dict[str, dict] = {
         "secret": "api_key",
         "secret_label": "Access token (PAT or SAT)",
         "key_hint": "a Qoder personal or service-account token",
+    },
+    # HARU FORK: a connection to the operator's Mac host, not a model-provider
+    # API. The secret scopes one Dispatch identity; the host retains all CLI
+    # subscription credentials and selects a provider from fresh quota state.
+    "local_subscription": {
+        "label": "HARU local subscription (experimental)",
+        "base_url": None,
+        "fields": [{"key": "base_url", "label": "Dispatch MCP endpoint",
+                    "placeholder": "https://dispatch.example.com/mcp"}],
+        "secret": "api_key",
+        "secret_label": "Dispatch access token",
+        "key_hint": "scoped HARU Dispatch token",
     },
     "tokenrouter": {
         "label": "TokenRouter",
@@ -6224,9 +6307,17 @@ async def admin_integrations_put(body: IntegrationsBody, request: Request) -> di
             raise HTTPException(400, f"integration needs a name and a known provider (got '{provider}')")
         cfg = {k: v for k, v in (i.get("config") or {}).items() if v not in (None, "")}
         # The client never sees secrets (sentinel) — carry stored values through unchanged edits.
-        prior_cfg = (stored.get(name) or {}).get("config") or {}
+        prior = stored.get(name) or {}
+        prior_cfg = prior.get("config") or {}
+        prior_provider = str(prior.get("provider") or "").lower()
         for k in _INTEGRATION_SECRET_FIELDS:
             if cfg.get(k) == _SECRET_SENTINEL:
+                # HARU FORK: a masked source token is reusable only for the
+                # same Dispatch endpoint and provider. Never retarget an old
+                # credential by editing a public config field in the same save.
+                rebinding = _local_subscription_token_rebind_error(provider, prior_provider, cfg, prior_cfg)
+                if rebinding:
+                    raise HTTPException(400, f"integration '{name}': {rebinding}")
                 if not prior_cfg.get(k):
                     raise HTTPException(400, f"integration '{name}': missing {k}")
                 cfg[k] = prior_cfg[k]
@@ -6249,6 +6340,16 @@ async def admin_integrations_put(body: IntegrationsBody, request: Request) -> di
         known_base = (_PROVIDER_CATALOG.get(provider) or {}).get("base_url")
         if known_base and not cfg.get("base_url"):
             cfg["base_url"] = known_base
+        if provider == "local_subscription":
+            # HARU FORK: never turn an incomplete or generic provider row into
+            # a vaguely configured local execution path. The token is scoped to
+            # Dispatch; provider OAuth/API keys remain on the Mac host.
+            endpoint_error = _local_subscription_endpoint_error(cfg.get("base_url"))
+            if endpoint_error:
+                raise HTTPException(400, f"integration '{name}': {endpoint_error}")
+            if not isinstance(cfg.get("api_key"), str) or not cfg["api_key"].strip():
+                raise HTTPException(400, f"integration '{name}': Dispatch access token is required")
+            cfg["base_url"] = str(cfg["base_url"])
         # The custom form's API-format select shows "OpenAI Chat Completions" preselected, so a
         # payload that never touched it means the user accepted that default — but a select's
         # visible default is not form STATE, and a custom integration stored without api_format
@@ -6289,6 +6390,10 @@ async def admin_integrations_put(body: IntegrationsBody, request: Request) -> di
             if not isinstance(m, dict):
                 raise HTTPException(400, f"integration '{name}': each model is an id or {{canonical, provider_id}}")
             rows.append((str(m.get("canonical") or "").strip(), str(m.get("provider_id") or "").strip()))
+        if provider == "local_subscription":
+            allowed = set(_VENDOR_MODELS["local_subscription"])
+            if any(c not in allowed or (pid and pid != c) for c, pid in rows):
+                raise HTTPException(400, f"integration '{name}': local subscription models are fixed Dispatch selectors")
         if provider == "custom":
             # No vendor table: the rows are the endpoint's model list, kept whole (see
             # _integration_models); a blank wire id is the canonical, written out so the stored
@@ -7423,6 +7528,12 @@ _VENDOR_MODELS["qoder"] = {m: m for m in (
     "dfmodel",         # DeepSeek-Flash
     "mmodel",          # MiniMax-M3
 )}
+# HARU FORK: these are dispatch policy selectors, never provider-billed model
+# identifiers. The Mac host resolves auto/provider choice from its subscription
+# login and fresh usage snapshot.
+_VENDOR_MODELS["local_subscription"] = {
+    "haru-auto": "haru-auto", "haru-codex": "haru-codex", "haru-claude": "haru-claude",
+}
 
 # Vercel's AI Gateway carries the same catalogue under nearly the same slugs, so it starts from
 # OpenRouter's table too. Only the vendor prefix differs on four of them, and it differs because
@@ -8090,6 +8201,10 @@ _MODEL_CATALOG["qoder"] = {"default": "ultimate",
                            # the five console scenarios. Qoder also lists cmodel (Cantus), not measured
                            # and not offered: one turn there costs about 16 credits
                            "models": list(_VENDOR_MODELS["qoder"])}
+# HARU FORK: selectors accepted by the Mac Dispatch adapter. They intentionally
+# say nothing about a paid API model or token pricing.
+_MODEL_CATALOG["herdr"] = {"default": "haru-auto",
+                            "models": ["haru-auto", "haru-codex", "haru-claude"]}
 # A pair the matrix failed twice on the one aggregator that serves the id is not offered on that
 # harness (2026-09-13, five scenarios each): llama-4-maverick on OpenRouter under qwen writes the
 # tool call as prose; llama-3.3-70b on OpenRouter fails the recall under goose, the artifact under
@@ -8283,6 +8398,24 @@ async def _vision_auth(sid: str, backend: str) -> dict | None:
         return {"provider": provider, "model": served[canonical],
                 "base_url": auth.get("base_url") or "", "api_key": auth["api_key"]}
     return None
+
+
+async def _turn_auxiliary_media_auth(sid: str, backend: str) -> tuple[dict | None, dict | None]:
+    """Return optional image/vision credentials for a backend's own runtime.
+
+    HARU's first Herdr adapter is a read-only subscription bridge.  It must not
+    inherit an unrelated image or vision integration merely because one happens
+    to be configured on this HarnessRouter instance: that would turn a local
+    subscription task into an unannounced paid-provider request.
+    """
+    if backend == "herdr":
+        return None, None
+    return await _image_auth(sid, backend), (await _vision_auth(sid, backend) if backend == "hermes" else None)
+
+
+def _backend_vision_hint(backend: str, model: str) -> bool:
+    """Whether this runner turn may request ordinary model vision support."""
+    return backend != "herdr" and model.strip().lower() not in _TEXT_ONLY_INPUT
 
 
 def _conn_serves(conn: dict, friendly: str) -> bool:
@@ -8952,6 +9085,15 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
     # HR-INF-010: the caller (create_response) already read this harness's vertex — thread it in
     # instead of re-reading it twice more here. Beyond cutting reads, a same-request snapshot means
     # _harness_plugins and agent_doc can't observe a mid-turn config edit inconsistently.
+    if backend == "herdr":
+        alias_error = _herdr_runtime_alias_error(hv)
+        if alias_error:
+            # Do this before _harness_env so an imported legacy record cannot
+            # resolve a vault/header reference into the Driver's checkpoint.
+            rec["status"] = "failed"
+            rec["error_message"] = alias_error
+            rec["tried"] = [{"connection": "", "status": "refused", "error": alias_error}]
+            return "failed", [], rec
     mcp_servers, skills, skills_suppressed, tools_disabled, plugin_pkgs = await _harness_plugins(harness_id, org, hdr_vals, hv=hv, sid=sid)
     turn_env, turn_secret = await _harness_env(hv, org, hdr_vals)
     if mcp_servers or skills or skills_suppressed or tools_disabled:
@@ -9006,11 +9148,11 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
         elif model_req not in seen:
             await _vertex_upsert(sid, {"models_seen": ",".join(seen + [model_req])})
     # Independent of which chat connection wins below: images are usually a different provider.
-    image_auth = await _image_auth(sid, backend)
+    # The Herdr adapter is intentionally excluded by _turn_auxiliary_media_auth.
+    image_auth, vision_auth = await _turn_auxiliary_media_auth(sid, backend)
     skills, skills_suppressed = _without_shadowing_image_skill(skills, skills_suppressed, image_auth, mcp_servers)
     if "plugins" in rec:        # the record says what the turn was given, so after that change
         rec["plugins"].update(skills=[s_.get("name") for s_ in skills], skills_off=skills_suppressed)
-    vision_auth = await _vision_auth(sid, backend) if backend == "hermes" else None
     for name, pre in candidates:
         conn, src = (pre, "integration") if pre is not None else await _get_connection(org, name)
         if not conn:
@@ -9092,7 +9234,7 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                 # token-level streaming (claude): runner adds --include-partial-messages + emits deltas
                 "partial_messages": bool(partial_messages),
                 # pi: whether this model's channel takes image input (see _TEXT_ONLY_INPUT)
-                "vision": model_req.strip().lower() not in _TEXT_ONLY_INPUT,
+                "vision": _backend_vision_hint(backend, model_req),
                 # hermes: which integration answers its image questions (vision_analyze, browser
                 # tools), resolved across the instance like image generation, so the capability
                 # does not depend on the model chosen to write with. See _vision_auth.
@@ -11294,6 +11436,7 @@ async def cancel_response(response_id: str, request: Request):
         except Exception:  # noqa: BLE001
             pass
     was_live = str(rec.get("status") or "") in ("running", "in_progress", "queued", "starting")
+    v: dict | None = None
     if was_live and sid:
         v = await _vertex_get(sid)
         v_rt = str((v or {}).get("runner_turn_id") or "")
@@ -11315,6 +11458,13 @@ async def cancel_response(response_id: str, request: Request):
             # Not confirmed as the live turn: latch this record cancelled in blob + graph (keep
             # them consistent) and let the turn's own resp_is_cancelled check settle it.
             rec["status"] = "cancelled"
+            if _haru_host_stop_unverified(v):
+                metadata = dict(rec.get("metadata") or {})
+                metadata["haru_stop"] = "unverified"
+                metadata["haru_stop_detail"] = (
+                    "Cancellation was requested from HARU; Mac process termination is not verified."
+                )
+                rec["metadata"] = metadata
             rec.setdefault("_completed_at", time.time())     # the turns feed's completed_at
             try:
                 _resp_cache_forget(response_id)
@@ -18446,6 +18596,20 @@ _BASE_CATALOG: dict[str, dict] = {
         "environments": False,
         "remote": True,
     },
+    # HARU FORK: this is an opt-in bridge to the operator's Mac. It exposes no
+    # container filesystem, skill, plugin, MCP, or tool capability because the
+    # first adapter accepts only a registered read-only Dispatch workspace.
+    "herdr": {
+        # `ready` means this fork implements the adapter. It does not claim a
+        # Mac host is online: its selectors remain unavailable until an explicit
+        # local_subscription integration is configured.
+        "label": "HARU Herdr subscription (experimental)", "backend": "herdr", "status": "ready",
+        "system_prompt": ("This task runs through HARU Dispatch in a visible Herdr pane using an "
+                          "operator-owned subscription. Work only in the registered read-only project "
+                          "selected by HARU; report actual observations and do not assume API credentials."),
+        "tools": [], "tool_enforcement": "hard", "skills": False,
+        "environments": False, "remote": True,
+    },
     "qwen": {
         "label": "Qwen Code", "backend": "qwen", "status": "ready",
         "system_prompt": ("You are Qwen Code, an autonomous coding agent. You work on a real git "
@@ -18881,6 +19045,49 @@ def _harness_props(body: HarnessBody) -> dict:
 
 _WS_WRITE_MAX = 4 * 1024 * 1024   # an app writing its own state, not an upload path
 _SKILL_INLINE_MAX = 48_000   # keep the vertex `skills` prop safely under the 64k value cap
+_HARU_WORKSPACE_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _haru_workspace_alias(value: object) -> str | None:
+    """A literal registered alias, never a late-bound secret or request header."""
+    if not isinstance(value, str) or not _HARU_WORKSPACE_ALIAS.fullmatch(value):
+        return None
+    lowered = value.lower()
+    if lowered.startswith(("vault:", "secret:", "$headers.")):
+        return None
+    return value
+
+
+def _herdr_runtime_alias_error(harness: dict | None) -> str:
+    """Validate legacy/imported Herdr config before resolving any environment reference."""
+    env = _parse_env((harness or {}).get("env"))
+    if set(env) != {"HARU_WORKSPACE"} or _haru_workspace_alias(env.get("HARU_WORKSPACE")) is None:
+        return "Herdr requires HARU_WORKSPACE to be one literal registered project alias; secret and header references are not allowed."
+    return ""
+
+
+def _validate_herdr_harness(body: HarnessBody) -> None:
+    """Keep the Console's manual Herdr setup inside the adapter's real boundary.
+
+    The runner performs the same check before a host task is submitted. Doing it
+    at setup time keeps unsupported settings from looking saved and then failing
+    much later at the first task.
+    """
+    if _require_supported_base(body.base) != "herdr":
+        return
+    env = body.env or {}
+    alias = env.get("HARU_WORKSPACE") if isinstance(env, dict) else None
+    unsupported = {
+        "mcp_servers": body.mcp_servers, "skills": body.skills, "plugins": body.plugins,
+        "disabled_tools": body.disabled_tools, "additional_headers": body.additional_headers,
+        "environment": body.environment, "calibrates": body.calibrates,
+    }
+    if set(env) != {"HARU_WORKSPACE"} or _haru_workspace_alias(alias) is None:
+        raise HTTPException(400, "Herdr requires HARU_WORKSPACE to be one registered project alias, never a path")
+    if any(value for value in unsupported.values()):
+        raise HTTPException(400, "Herdr does not support MCP servers, skills, plugins, tools, environments, headers, or calibration")
+    if body.reasoning_effort:
+        raise HTTPException(400, "Herdr subscription selection does not accept a gateway reasoning override")
 
 
 def _mcp_servers_prepare(incoming: list | None) -> list[dict]:
@@ -20029,6 +20236,7 @@ async def create_harness(org: str, body: HarnessBody, request: Request) -> dict:
     # a key held to a workspace stamps its own, whatever header it sends; any other caller names it
     workspace = _key_scope(p) or request.headers.get("x-harness-workspace", "")
     await _require_offered_model(org, body.base, body.default_model)
+    _validate_herdr_harness(body)
     body.mcp_servers = _mcp_servers_prepare(body.mcp_servers)
     body.skills = await _skills_prepare(body.skills)
     await _environment_check_ref(org, body.environment)
@@ -20131,6 +20339,7 @@ async def update_harness(org: str, hid: str, body: HarnessBody, request: Request
                         "base", {"base": cur.get("base")})
     body.base = str(cur.get("base") or body.base)
     await _require_offered_model(org, body.base, body.default_model, str(cur.get("default_model") or ""))
+    _validate_herdr_harness(body)
     # coalesce-upsert: created_at/org are untouched (only the provided props are set)
     body.mcp_servers = _mcp_servers_prepare(body.mcp_servers)
     body.skills = await _skills_prepare(body.skills)
@@ -20316,6 +20525,7 @@ async def _harness_create_as(p: dict, body: HarnessBody, hid: str | None = None)
     if not org:
         raise uhp_error(401, "invalid_credential", "Missing or invalid API key.")
     await _require_offered_model(org, body.base, body.default_model)
+    _validate_herdr_harness(body)
     body.mcp_servers = _mcp_servers_prepare(body.mcp_servers)
     body.skills = await _skills_prepare(body.skills)
     await _environment_check_ref(org, body.environment)
@@ -20346,7 +20556,7 @@ class SetupBuildBody(BaseModel):
 
 # A base Auto never picks although it takes skills: qoder runs on its own remote runtime, which mounts
 # no environment and reads none of this instance's keys.
-_SETUP_NOT_AUTO = frozenset({"qoder"})
+_SETUP_NOT_AUTO = frozenset({"qoder", "herdr"})
 _SETUP_MEDIA_DECL = {"name": "media", "id": "mcp.media"}
 
 
@@ -21851,6 +22061,7 @@ async def update_harness_public(hid: str, body: HarnessBody, request: Request) -
                         "base", {"base": v.get("base")})
     body.base = str(v.get("base") or body.base)
     await _require_offered_model(org, body.base, body.default_model, str(v.get("default_model") or ""))
+    _validate_herdr_harness(body)
     body.mcp_servers = _mcp_servers_prepare(body.mcp_servers)
     body.skills = await _skills_prepare(body.skills)
     await _environment_check_ref(org, body.environment)

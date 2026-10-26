@@ -227,6 +227,8 @@ wanted()   { [[ ",$HR_BACKENDS," == *",$1,"* ]]; }
 # from the console with no explanation.
 backend_bin() {
   case "$1" in
+    # HARU fork: built-in stdlib driver; native subscription CLIs stay on Mac.
+    herdr) echo "$PY" ;;
     claude) echo "$TOOLS/bin/claude" ;;
     codex)  echo "$TOOLS/bin/codex" ;;
     hermes) echo "$TOOLS/venv/bin/hermes" ;;

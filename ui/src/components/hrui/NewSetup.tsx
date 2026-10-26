@@ -25,7 +25,7 @@
 // free requests are not part of this edition).
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { useRouter } from 'next/navigation';
-import { offeredOob, oobById, oobDefaultModel, useBasesRead, useModelCatalogRead } from '@/lib/harness';
+import { createCustom, offeredOob, oobById, oobDefaultModel, useBasesRead, useModelCatalogRead } from '@/lib/harness';
 import { providerById, useModelProviders } from '@/lib/providers';
 import { harnessLogoSrc } from '@/components/HarnessLogo';
 import { Sheet } from './Sheet';
@@ -76,6 +76,8 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
   const offered = offeredOob(bases);
   const demo = pre?.demo != null && DEMOS[pre.demo] ? pre.demo : null;
   const [job, setJob] = useState(() => (demo != null ? DEMOS[demo].instr : pre?.job || ''));
+  const [setupName, setSetupName] = useState('');
+  const [workspaceAlias, setWorkspaceAlias] = useState('');
   // Auto unless a demo names its pair; a demo's model lands with the catalog
   // a demo opens on its own harness when the server offers it; else on Auto (the page says the demo's
   // harness is not available), never another harness in its place
@@ -109,6 +111,7 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
   }, []);
 
   const hAuto = h === AUTO, mAuto = m === AUTO;
+  const herdr = h === 'herdr';
   const hName = h && !hAuto ? baseName(h, bases) : '';
   // the harnesses Auto may pick, as the server's composer reads them
   const autoBases = useMemo(() => offeredOob(bases).filter((o) => bases?.[o.id]?.takesSkills !== false && !OWN_TOKEN_ONLY.includes(o.id)).map((o) => o.id), [bases]);
@@ -128,7 +131,8 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
   const anyRuns = !!catalog && autoBases.some(runs);
   const noneRuns = !!catalog && !offered.some((o) => runs(o.id));
   const hRuns = !!catalog && !!h && !hAuto && runs(h);
-  const ready = offered.length > 0 && !!catalog && !!h && !!m && (hAuto ? anyRuns : hRuns);
+  const manualHerdrReady = herdr && !!catalog && hRuns && !!setupName.trim() && !!workspaceAlias.trim();
+  const ready = herdr ? manualHerdrReady : (offered.length > 0 && !!catalog && !!h && !!m && (hAuto ? anyRuns : hRuns));
 
   // the drawing: a brick drops in when its choice changes
   const artH = hName, artM = mAuto ? '' : m;
@@ -195,6 +199,23 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
     if (demoNow == null && tooShort(j)) { setErr(SENTENCE); ta.current?.focus(); return; }
     if (!ready) return;
     setPick(null); setBusy(true); setErr(''); gone.current = false;
+    if (herdr) {
+      try {
+        const saved = await createCustom({
+          name: setupName.trim(), base: 'herdr', baseLabel: 'HARU Herdr subscription (experimental)',
+          defaultModel: mAuto ? 'haru-auto' : m, systemPrompt: j,
+          env: { HARU_WORKSPACE: workspaceAlias.trim() },
+        });
+        if (gone.current) return;
+        openNewSetup(router, { id: saved.id });
+        return;
+      } catch (e) {
+        if (!gone.current) setErr(e instanceof Error ? e.message : 'HARU setup could not be saved.');
+      } finally {
+        if (!gone.current) setBusy(false);
+      }
+      return;
+    }
     // the sheet closes and the setup's page opens at once: the rest happens there (start/build.ts), and
     // the only place it lands is that setup's Tasks (start/open.ts). Auto goes to the server as is: it
     // picks the harness and model, never a guess made here
@@ -269,6 +290,7 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
       <button type="button" className="link-q inl" onClick={() => { basesRead.retry(); catalogRead.retry(); }}>Try again</button></>]
     : bases && !offered.length ? ['bad', <>No agent harness is available on this instance.</>]
     // nothing runs without a model key: the builder and the setup both run on one of yours
+    : catalog && herdr && !hRuns ? ['warn', <>Configure a HARU local subscription connection before creating this setup.</>]
     : catalog && bases && (noneRuns || (hAuto && !anyRuns)) ? ['warn', <>Connect a model key to set up an agent harness. <a className="link-q inl" href="/byok">Connect a key</a></>]
     : catalog && h && !hAuto && !hRuns ? ['warn', <>None of your keys runs a model on {hName} yet. <a className="link-q inl" href="/byok">Add a key</a> or choose another harness.</>]
     : code ? ['warn', <><b>Changing code in your project?</b> Your coding agent does that.</>]
@@ -318,6 +340,17 @@ export function NewSetup({ pre, onClose }: { pre?: NewSetupPre; onClose: () => v
                 aria-busy={busy || undefined} disabled={!job.trim() || busy || !ready} onClick={() => void send()}>{UP}</button>
             </div>
           </div>
+          {herdr ? <div className="nw-ask" aria-label="HARU setup details" style={{ display: 'grid', gap: 8, padding: 14, marginTop: 12 }}>
+            <label className="nw-l" htmlFor="nwName">Setup name</label>
+            <input id="nwName" className="set-in" value={setupName} readOnly={busy}
+              placeholder="e.g. CardDex read-only analyst"
+              onChange={(e) => { setSetupName(e.target.value); if (err) setErr(''); }} />
+            <label className="nw-l" htmlFor="nwWorkspace">Registered project alias</label>
+            <input id="nwWorkspace" className="set-in" value={workspaceAlias} readOnly={busy}
+              placeholder="e.g. dispatch-fixture"
+              onChange={(e) => { setWorkspaceAlias(e.target.value); if (err) setErr(''); }} />
+            <small>The alias is checked by HARU Dispatch. This setup runs read-only through your configured Mac subscription.</small>
+          </div> : null}
           <div className={`nw-cost nw-msg ${msg[0]}`} id="nwCost" role="status">{msg[1]}</div>
           <div className="au-or nw-or" role="separator"><span>OR</span></div>
           <div className="nw-alt">
