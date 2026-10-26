@@ -32,7 +32,10 @@ accepted routed tasks. Drain or cancel each by its original source identity;
 never bulk-activate or fall back directly to a model. Activated tasks keep their
 source identity and can finish through existing workers. Keep the new compatible
 broker/pump and Router running until pending rows are zero. Do not restore an old
-DB snapshot over tasks accepted after the backup.
+DB snapshot over tasks accepted after the backup. An old-binary rollback must
+restore its matching Compose command and configuration together: older runtimes
+do not accept `combined`, `router`, or `dispatch.legacy_enabled`. Do not binary-
+rollback while routed tasks remain; drain them with compatible code first.
 
 ## Acceptance boundary
 
@@ -46,3 +49,14 @@ execute one harmless registered fixture and return through that conversation's
 original callback/ACK. A controlled fixture ACK or direct operator submission is
 not a claim of a visible Grok App reply. If the app-control transport is unavailable,
 record the server receipts and ask for the smallest remaining source-side check.
+
+
+## Retire legacy processes after live native acceptance
+
+Preserve the session worker, fixed tunnel, SQLite volumes and original MCP URL.
+Before unloading the legacy host worker, set `dispatch.legacy_enabled=false`
+and inspect the broker for zero legacy queued/running tasks and the host for
+zero active legacy executors. Preserve history; drain an existing task rather
+than restoring a pre-task snapshot. Stop separate delivery before starting the
+compact `combined` runtime, so only one delivery loop owns callback attempts.
+Compare RSS/container memory after shutdown and record retained dependencies.
