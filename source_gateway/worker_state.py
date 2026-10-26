@@ -13,6 +13,8 @@ import stat
 import tempfile
 from typing import Callable
 
+from .filesystem import durable_tree, sync_directory
+
 
 LOCATORS = ("prompt_path", "schema_path", "report_path", "provider_report_path", "process_path")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
@@ -193,7 +195,11 @@ def migrate_worker_state(source: str | os.PathLike, destination: str | os.PathLi
         report["locator_fields"] = list(LOCATORS)
         (stage / ".worker-migration.json").write_text(json.dumps(report, indent=2) + "\n")
         (stage / ".worker-migration.json").chmod(0o600)
+        durable_tree(stage)
+        if target.exists() or target.is_symlink():
+            raise WorkerMigrationError("worker destination changed during migration")
         os.replace(stage, target)
+        sync_directory(target.parent)
         return report
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)

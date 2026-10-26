@@ -2,6 +2,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -103,3 +104,29 @@ def test_destination_parent_alias_cannot_write_into_source(tmp_path):
     with pytest.raises(WorkerMigrationError, match='overlaps'):
         migrate_worker_state(root, alias / 'new', quiesced=True, pid_alive=lambda _: False)
     assert not (root / 'new').exists()
+
+
+def test_worker_promotion_flushes_bytes_then_rename_and_parent(tmp_path):
+    root, _ = fixture(tmp_path)
+    target = tmp_path / 'new'
+    from source_gateway import worker_state
+    events = []
+    rename = worker_state.os.replace
+    with patch.object(worker_state, 'durable_tree', side_effect=lambda p: events.append('tree')), \
+            patch.object(worker_state.os, 'replace', side_effect=lambda a, b: (events.append('rename'), rename(a, b))[1]), \
+            patch.object(worker_state, 'sync_directory', side_effect=lambda p: events.append('parent')):
+        migrate_worker_state(root, target, quiesced=True, pid_alive=lambda _: False)
+    assert events == ['tree', 'rename', 'parent']
+
+
+def test_target_appearing_before_promotion_is_preserved(tmp_path):
+    root, _ = fixture(tmp_path)
+    target = tmp_path / 'new'
+    from source_gateway import worker_state
+    def other_writer(_):
+        target.mkdir()
+        (target / 'owner.txt').write_text('other writer')
+    with patch.object(worker_state, 'durable_tree', side_effect=other_writer), \
+            pytest.raises(WorkerMigrationError, match='changed during'):
+        migrate_worker_state(root, target, quiesced=True, pid_alive=lambda _: False)
+    assert (target / 'owner.txt').read_text() == 'other writer'
