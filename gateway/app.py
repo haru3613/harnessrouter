@@ -1936,6 +1936,38 @@ async def _mapped_integration_conn(backend: str, canonical: str) -> dict | None:
     return conn
 
 
+async def _haru_route_integration_conn(backend: str, canonical: str) -> dict | None:
+    """Build the sole integration allowed to receive a HARU route capability.
+
+    Route adoption intentionally ignores the global model map and chain
+    fallbacks: a changed map must never direct the capability to a different
+    endpoint.
+    """
+    name = os.environ.get("HR_HARU_ROUTE_INTEGRATION", "").strip()
+    endpoint = os.environ.get("HR_HARU_ROUTE_MCP_ENDPOINT", "").strip()
+    if not name or _local_subscription_endpoint_error(endpoint):
+        return None
+    integ = next((item for item in await _integrations_doc()
+                  if str(item.get("name") or "") == name), None)
+    if not integ or str(integ.get("provider") or "").lower() != "local_subscription":
+        return None
+    config = integ.get("config") if isinstance(integ.get("config"), dict) else {}
+    if str(config.get("base_url") or "") != endpoint:
+        return None
+    if _INTEGRATION_WIRING.get(("local_subscription", backend)) != "local_subscription":
+        return None
+    models = _integration_models(integ)
+    pid = (models.get(canonical) or models.get(canonical.lower())) if canonical else ""
+    if canonical and not pid:
+        return None
+    conn = {"name": f"integration:{name}", "backend": backend, "provider": "local_subscription",
+            **{k: v for k, v in config.items() if v not in (None, "")}}
+    if pid:
+        conn["model"] = pid
+        conn["_model_resolved"] = True
+    return conn
+
+
 # ── pool proxy ───────────────────────────────────────────────────────────────────
 def _pool_headers() -> dict:
     """Auth headers for the runner: the cloud identity token through a session pool; beside a local
@@ -9125,11 +9157,21 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
             runner_prompt = _history_prompt(_hist, prompt)
         except Exception:  # noqa: BLE001
             pass
-    # Model→integration mapping (global token-provider routing): a mapped model runs on its
-    # integration FIRST; the backend's policy chain stays as the failure fallback.
-    mapped_conn = await _mapped_integration_conn(backend, model_req)
-    candidates: list[tuple[str, dict | None]] = ([(mapped_conn["name"], mapped_conn)] if mapped_conn else [])
-    candidates += [(n, None) for n in chain]
+    # A staged HARU adoption is bound to one named, endpoint-pinned
+    # local_subscription integration. It never enters the global model-map or
+    # fallback chain, either of which could otherwise receive its capability.
+    if haru_route_descriptor is not None:
+        pinned = await _haru_route_integration_conn(backend, model_req)
+        candidates: list[tuple[str, dict | None]] = ([(pinned["name"], pinned)] if pinned else [])
+        if not pinned:
+            rec["tried"].append({"connection": "haru-route", "status": "refused",
+                                  "error": "HARU route integration is unavailable or no longer pinned"})
+    else:
+        # Model→integration mapping (global token-provider routing): a mapped model runs on its
+        # integration FIRST; the backend's policy chain stays as the failure fallback.
+        mapped_conn = await _mapped_integration_conn(backend, model_req)
+        candidates = ([(mapped_conn["name"], mapped_conn)] if mapped_conn else [])
+        candidates += [(n, None) for n in chain]
     if backend == "codex" and model_req:
         # The session remembers every model it has run. A gpt-5.3-codex turn after another model
         # family is refused, in words, rather than run without its tools or restarted on a fresh
@@ -10386,12 +10428,14 @@ async def create_response(body: CreateResponseBody, request: Request):
     want_appserver = (backend == "codex" and (
         os.environ.get("HARNESS_CODEX_APPSERVER", "0") == "1" or bool(meta.get("codex_appserver"))))
     chain = await _resolve_chain(org, backend, None)
+    if route_claim is not None and not await _haru_route_integration_conn(backend, model_req):
+        raise uhp_error(403, "forbidden", "The HARU route integration is not pinned to its configured endpoint.")
     # The chain is the FALLBACK, not the entry condition: a model mapped to an integration runs on
     # that integration first (see the candidate list in _resp_execute). Requiring a policy chain
     # here rejected the turn before the executor could ever reach the integration — so a user who
     # had just added their own key was told there was no connection for the backend, which was
     # both wrong and unactionable. Only refuse when NOTHING can serve it.
-    if not chain and not await _mapped_integration_conn(backend, model_req):
+    if route_claim is None and not chain and not await _mapped_integration_conn(backend, model_req):
         raise HTTPException(400, f"no provider configured for backend '{backend}'. Add an "
                                  f"integration for a provider that serves '{model_req or backend}', "
                                  f"or configure a connection policy")

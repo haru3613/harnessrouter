@@ -83,7 +83,8 @@ def main():
         if line and not line.startswith('#') and '=' in line:
             k,v=line.split('=',1);env[k]=v
     env.update(HARU_ROUTE_API_KEY_SHA256=hashlib.sha256(key.encode()).hexdigest(),
-               HARU_ROUTE_WORKSPACE=created['workspace'],HARU_ROUTE_HARNESSES=','.join(created['harnesses'].values()))
+               HARU_ROUTE_WORKSPACE=created['workspace'],HARU_ROUTE_HARNESSES=','.join(created['harnesses'].values()),
+               HARU_ROUTE_INTEGRATION='haru-grok-router',HARU_ROUTE_MCP_ENDPOINT=a.mcp_endpoint)
     private_write(envfile,''.join(k+'='+v+'\n' for k,v in env.items()))
     proposal={'enabled':False,'origins':['haru-main'],'principals':['harnessrouter'],
               'gateway_url':'http://harnessrouter:3000/api/harness','local_gateway_hosts':['harnessrouter'],

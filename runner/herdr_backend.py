@@ -93,6 +93,9 @@ def build_command(provider, auth, model, prompt, cwd, env, *, workspace, request
          'workspace':workspace,'base_url':endpoint,'request_id':request_id,
          'resume_session_id':resume_session_id or '', 'timeout_seconds':timeout_seconds}
     if haru_route is not None:
+        expected_endpoint = str(env.get('HR_HARU_ROUTE_MCP_ENDPOINT') or '')
+        if not expected_endpoint or endpoint != validate_endpoint(expected_endpoint):
+            raise ValueError('HARU route must use the operator-pinned Dispatch MCP endpoint')
         capability = env.get('HR_HARU_ROUTE_CAPABILITY')
         # Persist identifiers only. Capability stays in process memory/env.
         job['haru_route'] = _route_verify(haru_route, capability)

@@ -12019,7 +12019,9 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
     rec["pid"] = proc.pid
     rec["proc"] = proc   # live handle so POST /turn/{id}/cancel can kill on demand
     if rec.get("cancelled"):
-        _kill_proc_tree(proc, turn_id)   # Stop raced the spawn — kill immediately, not at pipe EOF
+        # A remote driver owns a source-side task. Even when cancellation wins
+        # the spawn race it needs SIGTERM first to cancel that task.
+        _stop_proc(proc, rec)
     # Hard wall-clock cap — the caller's timeout_seconds (harness config / request override),
     # bounded by the global MAX_TURN_SECONDS ceiling (resource abuse backstop).
     cap = min(timeout_seconds, MAX_TURN_SECONDS) if timeout_seconds else MAX_TURN_SECONDS

@@ -83,3 +83,12 @@ inspection/activation/cancellation and never silently fall back.
 Final proof: a real Grok-origin task has one HARU ID, one HarnessRouter response, one
 native execution, a visible result in HarnessRouter, original-source handling/ACK and
 safe pane cleanup. Desktop tool availability is a separate UI proof boundary.
+
+
+Adoption also requires `HR_HARU_ROUTE_INTEGRATION` and
+`HR_HARU_ROUTE_MCP_ENDPOINT` to match the named local-subscription connection
+exactly, in both Gateway and Runner. Global model maps and fallback chains are
+not candidates for adoption. Cancellation before activation or before a worker
+claim terminates the source task and emits its original return event; active
+work receives a cancellation request, with the host retaining responsibility
+for reporting whether the process stopped.
