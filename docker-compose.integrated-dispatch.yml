@@ -1,0 +1,121 @@
+# Pair only with docker-compose.haru.yml. The old Dispatch Compose project and
+# its external network are not part of this deployment.
+services:
+  harnessrouter:
+    image: ${HR_HARNESSROUTER_IMAGE:-haru-harnessrouter:local}
+    environment:
+      HARNESS_INTERNAL_KEY: ${HARU_INTERNAL_KEY:?Set a persistent internal service key}
+      HR_HARU_ROUTE_API_KEY_SHA256: ${HARU_ROUTE_API_KEY_SHA256:-}
+      HR_HARU_ROUTE_WORKSPACE: ${HARU_ROUTE_WORKSPACE:-}
+      HR_HARU_ROUTE_HARNESSES: ${HARU_ROUTE_HARNESSES:-}
+      HR_HARU_ROUTE_INTEGRATION: ${HARU_ROUTE_INTEGRATION:-haru-grok-router}
+      HR_HARU_ROUTE_MCP_ENDPOINT: ${HARU_ROUTE_MCP_ENDPOINT:?Set the fixed public HTTPS MCP endpoint}
+    networks:
+      - route
+
+  source-gateway:
+    image: ${HR_SOURCE_GATEWAY_IMAGE:-harnessrouter-source-gateway:local}
+    build:
+      context: .
+      dockerfile: docker/dispatch.Dockerfile
+      additional_contexts:
+        dispatch_source: ${HR_DISPATCH_SOURCE_DIR:?Set the private dispatch source artifact directory}
+      args:
+        HR_DISPATCH_SOURCE_REVISION: ${HR_DISPATCH_SOURCE_REVISION:?Set the pinned dispatch source revision}
+        HR_DISPATCH_ARTIFACT_SHA256: ${HR_DISPATCH_ARTIFACT_SHA256:?Set the pinned dispatch artifact tree hash}
+    command: [run]
+    user: "501:10001"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    cpus: 0.5
+    ports:
+      - "127.0.0.1:8769:8769"
+    volumes:
+      - dispatch-state:/state
+      - type: bind
+        source: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/config.json
+        target: /run/config/config.json
+        read_only: true
+    secrets:
+      - haru_token
+      - dots_token
+      - worker_token
+      - router_token
+      - grok_url
+      - grok_token
+      - router_api_key
+    environment:
+      HARU_DISPATCH_STATE_DIR: /state
+      HARU_RUNTIME_CONFIG: /run/config/config.json
+      HR_DISPATCH_COMPAT_ROOT: /app/compat
+      HR_DISPATCH_SOURCE_REVISION: ${HR_DISPATCH_SOURCE_REVISION:?Set the pinned dispatch source revision}
+      HARU_BRIDGE_HARU_TOKEN_FILE: /run/secrets/haru_token
+      HARU_BRIDGE_DOTS_TOKEN_FILE: /run/secrets/dots_token
+      HARU_BRIDGE_WORKER_TOKEN_FILE: /run/secrets/worker_token
+      HARU_BRIDGE_ROUTER_TOKEN_FILE: /run/secrets/router_token
+      HARU_GROK_WEBHOOK_URL_FILE: /run/secrets/grok_url
+      HARU_GROK_WEBHOOK_TOKEN_FILE: /run/secrets/grok_token
+      HARU_ROUTER_API_KEY_FILE: /run/secrets/router_api_key
+    healthcheck:
+      test: [CMD, python, -m, source_gateway.runtime, health]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    networks:
+      ingress:
+        aliases:
+          - mcp
+      route:
+
+  tunnel:
+    image: cloudflare/cloudflared:latest@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5
+    command: [tunnel, --no-autoupdate, run, --token-file, /run/secrets/named-tunnel-token]
+    user: "501:20"
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    volumes:
+      - type: bind
+        source: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/named-tunnel-token
+        target: /run/secrets/named-tunnel-token
+        read_only: true
+    depends_on:
+      source-gateway:
+        condition: service_healthy
+    networks:
+      - ingress
+
+volumes:
+  dispatch-state:
+
+networks:
+  ingress:
+  route:
+
+secrets:
+  haru_token:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/haru-token
+  dots_token:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/dots-token
+  worker_token:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/worker-token
+  router_token:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/router-token
+  grok_url:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/grok-url
+  grok_token:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/grok-token
+  router_api_key:
+    file: ${HR_DISPATCH_RUNTIME_DIR:?Set the HarnessRouter-owned dispatch runtime directory}/router-api-key
