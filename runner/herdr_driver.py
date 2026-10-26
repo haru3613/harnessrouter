@@ -40,7 +40,7 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MODELS = {"haru-auto": None, "haru-codex": "codex", "haru-claude": "claude"}
 _ACTIVE = {"queued", "running", "waiting_return", "session_running", "session_result_ready"}
 _JOB_FIELDS = {"cwd", "prompt", "agent_doc", "model", "workspace", "request_id",
-               "resume_session_id", "timeout_seconds", "base_url"}
+               "resume_session_id", "timeout_seconds", "base_url", "haru_route"}
 
 
 class DriverError(ValueError):
@@ -283,14 +283,29 @@ def _job(job: Mapping[str, Any], environ: Mapping[str, str]) -> tuple[dict[str, 
     prompt = job.get("prompt")
     agent_doc = job.get("agent_doc") or ""
     endpoint = validate_endpoint(job.get("base_url"))
-    token = _text(environ.get("HR_HERDR_TOKEN"), "HARU access token", 4096)
+    route = job.get("haru_route")
+    if route is not None:
+        if (not isinstance(route, Mapping) or set(route) != {"task_id", "fingerprint", "response_id", "harness_id", "capability_sha256"} or
+                not _ID.fullmatch(str(route.get("task_id") or "")) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(route.get("fingerprint") or "")) or
+                not _ID.fullmatch(str(route.get("response_id") or "")) or
+                not _ID.fullmatch(str(route.get("harness_id") or "")) or
+                not re.fullmatch(r"[0-9a-f]{64}", str(route.get("capability_sha256") or ""))):
+            raise DriverError("invalid HARU route adoption record")
+        # The configured local_subscription connection is itself the dedicated
+        # restricted router principal. This preserves its endpoint/token binding.
+        token = _text(environ.get("HR_HERDR_TOKEN"), "HARU router token", 4096)
+    else:
+        token = _text(environ.get("HR_HERDR_TOKEN"), "HARU access token", 4096)
     timeout = job.get("timeout_seconds", 600)
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 1 <= timeout <= 21600:
         raise DriverError("invalid timeout")
     resume = job.get("resume_session_id") or ""
     if resume and (not isinstance(resume, str) or not resume.startswith("haru:") or not _ID.fullmatch(resume[5:])):
         raise DriverError("invalid HARU continuation id")
-    task = compose_task(prompt, agent_doc)
+    # An adoption has a host-validated source task already. Never rewrite it
+    # from the Console prompt/instructions or apply the new-task size limit.
+    task = "" if route is not None else compose_task(prompt, agent_doc)
     payload: dict[str, Any] = {"task": task, "workspace": workspace, "request_id": request_id,
                                "mode": "analysis", "result_contract": "evidence_required"}
     provider = _MODELS[model]
@@ -298,6 +313,11 @@ def _job(job: Mapping[str, Any], environ: Mapping[str, str]) -> tuple[dict[str, 
         payload["requested_provider"] = provider
     if resume:
         payload["continue_task_id"] = resume[5:]
+    if route is not None:
+        # The original task payload/source/fingerprint remains HARU authority.
+        # This sentinel is private driver state and carries no capability.
+        payload = {"_haru_route": dict(route), "workspace": workspace, "model": model,
+                   "request_id": request_id}
     return payload, cwd, endpoint, token
 
 
@@ -336,7 +356,7 @@ class Turn:
         self.environ = dict(os.environ if environ is None else environ)
         self.payload, self.cwd, self.endpoint, self.token = _job(job, self.environ)
         self.timeout = float(job.get("timeout_seconds", 600))
-        self.emit = lambda method, payload: emit(method, _redact(payload, self.token))
+        self.emit = lambda method, payload: emit(method, _redact(_redact(payload, self.token), self.route_capability if hasattr(self, "route_capability") else ""))
         self.now, self.sleep = now, sleep
         self.client = client_factory(self.endpoint, self.token, timeout=min(self.timeout, 60))
         self.state_path = _state_path(self.cwd, self.payload["request_id"])
@@ -346,6 +366,12 @@ class Turn:
         except BaseException:
             self.lock.close()
             raise
+        self.route = self.payload.get("_haru_route") if isinstance(self.payload.get("_haru_route"), dict) else None
+        self.route_capability = self.environ.get("HR_HARU_ROUTE_CAPABILITY", "") if self.route else ""
+        if self.route and not _text(self.route_capability, "HARU route capability", 4096):
+            raise DriverError("HARU route capability is unavailable")
+        # Rebind the emitter after the route capability is known.
+        self.emit = lambda method, payload: emit(method, _redact(_redact(payload, self.token), self.route_capability))
         self.cancelled = False
 
     def close(self) -> None:
@@ -369,6 +395,8 @@ class Turn:
         _write_private(self.state_path, self.state)
 
     def _submit(self) -> Mapping[str, Any]:
+        if self.route:
+            return self._adopt()
         self._validate_continuation()
         # Persist intent before the first POST.  A signal or broken response at
         # this point has an unknown host outcome and must never be called
@@ -389,6 +417,30 @@ class Turn:
             self._save()
             return task
         raise TransportError("HARU MCP did not answer")
+
+    def _adopt(self) -> Mapping[str, Any]:
+        """Activate the pre-created source task; never create another task."""
+        route = self.route or {}
+        task_id = str(route["task_id"])
+        current = self.client.call("get_route_task", {"task_id": task_id})
+        task = current.get("task") if isinstance(current, Mapping) else None
+        expected_provider = _MODELS.get(self.payload.get("model"))
+        if (not isinstance(task, Mapping) or task.get("id") != task_id or task.get("workspace") != self.payload.get("workspace") or
+                task.get("router_harness_id") != route.get("harness_id") or
+                (expected_provider and task.get("requested_provider") != expected_provider)):
+            raise DriverError("HARU staged task does not match this Herdr route")
+        self.state["submission_attempted"] = True
+        self._save()
+        response = self.client.call("activate_route_task", {
+            "task_id": task_id, "fingerprint": route["fingerprint"],
+            "capability": self.route_capability, "response_id": route["response_id"],
+        })
+        task = response.get("task") if isinstance(response, Mapping) else None
+        if not isinstance(task, Mapping) or task.get("id") != task_id:
+            raise DriverError("HARU route activation returned an invalid task")
+        self.state["task_id"] = task_id
+        self._save()
+        return task
 
     def _validate_continuation(self) -> None:
         """Only a state record from this connection can authorize a native resume."""
@@ -417,13 +469,29 @@ class Turn:
         task_id = self.state.get("task_id")
         if not task_id:
             return self._submit()
-        response = self.client.call("get_task", {"task_id": task_id})
+        response = self.client.call("get_route_task" if self.route else "get_task", {"task_id": task_id})
         task = response.get("task") if isinstance(response, Mapping) else None
         if not isinstance(task, Mapping) or task.get("id") != task_id:
             raise DriverError("HARU returned an invalid task state")
         return task
 
     def cancel(self) -> str:
+        if self.route:
+            # A staged route has a task id before activate returns. Never call
+            # _task here: it would re-enter _adopt during a SIGTERM race.
+            task_id = str(self.route["task_id"])
+            try:
+                verified = self.client.call("get_route_task", {"task_id": task_id})
+                task = verified.get("task") if isinstance(verified, Mapping) else None
+                if not isinstance(task, Mapping) or task.get("id") != task_id:
+                    return "remote_stop_unknown"
+                self.client.call("cancel_route_task", {"task_id": task_id,
+                                                        "fingerprint": self.route["fingerprint"],
+                                                        "capability": self.route_capability,
+                                                        "response_id": self.route["response_id"]})
+            except (DriverError, TransportError):
+                return "remote_stop_unknown"
+            return "remote_stop_unknown"
         task_id = self.state.get("task_id")
         if not task_id:
             return ("remote_stop_unknown" if self.state.get("submission_attempted")
@@ -449,7 +517,7 @@ class Turn:
                 if state != last:
                     self.emit("notice", {"text": "HARU task state: " + "/".join(str(v or "-") for v in state)})
                     last = state
-                outcome = self._outcome(task, self.token)
+                outcome = self._outcome(task, self.token, adopted=bool(self.route))
                 if outcome is not None:
                     status, reason = outcome
                     final = _safe_output(task.get("result"), self.token)
@@ -459,7 +527,9 @@ class Turn:
                                                 "session_id": "haru:" + task_id, "remote": _facts(task)})
                     return 0
                 if self.now() >= deadline:
-                    reason = self.cancel()
+                    # Observation expiry is not source cancellation. Grok may be
+                    # waiting to answer a question on this same task.
+                    reason = "observation_timeout" if self.route else self.cancel()
                     self.emit("__hr_result", {"status": "incomplete", "reason": reason, "final": "",
                                                 "session_id": "haru:" + task_id, "remote": _facts(task)})
                     return 0
@@ -487,7 +557,7 @@ class Turn:
             self.close()
 
     @staticmethod
-    def _outcome(task: Mapping[str, Any], token: str) -> tuple[str, str] | None:
+    def _outcome(task: Mapping[str, Any], token: str, *, adopted: bool = False) -> tuple[str, str] | None:
         execution = task.get("execution_state")
         if execution == "succeeded":
             if isinstance(task.get("result"), str) and task["result"].strip():
@@ -496,6 +566,9 @@ class Turn:
         if execution in {"failed", "blocked"}:
             return "failed", _safe_output(task.get("result") or "HARU task failed", token, 1000)
         if execution == "waiting_input":
+            if adopted:
+                # Grok, the original source, owns the answer; keep this HR turn alive.
+                return None
             return "incomplete", "HARU task needs an answer; this backend cannot fabricate one"
         if execution in {"uncertain", "cancelled"}:
             return "incomplete", "HARU task outcome is not confirmed"
@@ -512,11 +585,15 @@ def main(argv: list[str] | None = None) -> int:
         _emit("__hr_result", {"status": "failed", "reason": "Herdr driver job is unreadable", "final": "", "session_id": ""})
         return 0
     turn: Turn | None = None
+    def on_term(_signum, _frame):  # noqa: ANN001
+        raise KeyboardInterrupt
+    # The runner waits for this readiness frame before signalling a cancellation
+    # that raced Popen.  Construct Turn first, so its cancellation owns an
+    # initialized source task/capability rather than reporting an unknown stop.
+    signal.signal(signal.SIGTERM, on_term)
     try:
         turn = Turn(raw)
-        def on_term(_signum, _frame):  # noqa: ANN001
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, on_term)
+        _emit("__hr_ready", {})
         return turn.run()
     except KeyboardInterrupt:
         reason = turn.cancel() if turn else "remote_stop_unknown"

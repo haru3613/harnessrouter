@@ -2,6 +2,8 @@
 import json
 import pathlib
 import sys
+import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +71,22 @@ def test_events_distinguish_progress_result_and_unknown_stop():
     assert 'may still be running' in hb.normalize.eof({},1)[0]['result']
 
 
+def test_adoption_grant_never_writes_capability_to_job(tmp_path, monkeypatch):
+    import hmac
+    import hashlib
+    monkeypatch.setenv("HARNESS_INTERNAL_KEY", "internal")
+    cap = "capability_123456789"
+    payload = {"task_id":"task-1","fingerprint":"a" * 64,"response_id":"resp-1","harness_id":"herdr-1","capability_sha256":hashlib.sha256(cap.encode()).hexdigest()}
+    proof = hmac.new(b"internal", json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+    env = {"HR_HARU_ROUTE_CAPABILITY":cap, "HR_HARU_ROUTE_MCP_ENDPOINT":"https://x.test/mcp"}
+    command = hb.build_command("local_subscription", SimpleNamespace(api_key="ordinary", base_url="https://x.test/mcp"),
+                               "haru-codex", "read", str(tmp_path), env, workspace="fixture", request_key="route",
+                               haru_route={**payload,"proof":proof})
+    job = json.loads(pathlib.Path(command[-1]).read_text())
+    assert cap not in json.dumps(job)
+    assert job["haru_route"] == payload
+
+
 def test_runner_registry_and_unsupported_input_refusal(monkeypatch,tmp_path):
     import server as rs
     from fastapi.testclient import TestClient
@@ -87,3 +105,67 @@ def test_runner_registry_and_unsupported_input_refusal(monkeypatch,tmp_path):
     assert response.status_code==400
     assert 'no remote task was submitted' in response.json()['detail']
     assert not (tmp_path/'workspaces').exists()
+
+
+def test_route_descriptor_is_refused_for_any_non_herdr_runner_backend(monkeypatch,tmp_path):
+    import server as rs
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(rs,'_SESSION_UIDS',False)
+    monkeypatch.setattr(rs,'WORKSPACE_ROOT',str(tmp_path/'workspaces'))
+    with TestClient(rs.app) as client:
+        response=client.post('/turn?identifier=route-poison',json={
+            'backend':'claude','prompt':'x','haru_route':{'task_id':'task-1'},
+            'haru_route_capability':'capability_123456789'})
+    assert response.status_code == 400
+    assert 'only valid for the herdr backend' in response.json()['detail']
+    assert not (tmp_path/'workspaces').exists()
+
+
+def test_pre_spawn_cancel_waits_for_herdr_driver_readiness(monkeypatch,tmp_path):
+    import server as rs
+    rec={'status':'running','events':[],'result':'','done':False,'started':time.time(),
+         'backend':'herdr','cancelled':True}
+    monkeypatch.setitem(rs._turns,'herdr-ready-race',rec)
+    monkeypatch.setattr(rs,'_REMOTE_STOP_GRACE_S',.2)
+    child=("import json,signal,time; "
+           "signal.signal(signal.SIGTERM,lambda *_:exit(0)); "
+           "print(json.dumps({'m':'__hr_ready','p':{}}),flush=True); time.sleep(5)")
+    rs._run_turn_bg('herdr-ready-race',[sys.executable,'-c',child],{},str(tmp_path),
+                    lambda obj,state: [],'haru-codex',30)
+    assert rec.get('driver_ready') is True
+    assert 'cancel_after_driver_ready' not in rec
+
+
+def test_api_cancel_after_popen_defers_until_herdr_ready(monkeypatch,tmp_path):
+    import server as rs
+    rec={'status':'running','events':[],'result':'','done':False,'started':time.time(),'backend':'herdr'}
+    monkeypatch.setitem(rs._turns,'herdr-api-race',rec)
+    monkeypatch.setattr(rs,'_REMOTE_STOP_GRACE_S',.2)
+    original_stop=rs._stop_proc; stops=[]
+    def counted_stop(proc, record):
+        stops.append(proc.pid)
+        return original_stop(proc, record)
+    monkeypatch.setattr(rs,'_stop_proc',counted_stop)
+    child=("import json,signal,time; "
+           "signal.signal(signal.SIGTERM,lambda *_:exit(0)); time.sleep(.25); "
+           "print(json.dumps({'m':'__hr_ready','p':{}}),flush=True); time.sleep(5)")
+    thread=threading.Thread(target=rs._run_turn_bg,args=('herdr-api-race',[sys.executable,'-c',child],{},str(tmp_path),lambda obj,state: [],'haru-codex',30))
+    thread.start()
+    for _ in range(100):
+        if rec.get('proc') is not None: break
+        time.sleep(.01)
+    assert rec.get('proc') is not None
+    proc=rec['proc']
+    assert rs.cancel_turn('herdr-api-race')['cancelled'] is True
+    assert rs.cancel_turn('herdr-api-race')['cancelled'] is True
+    rs._kill_capped(proc,rec)
+    for _ in range(100):
+        if rec.get('cancel_after_driver_ready'): break
+        time.sleep(.01)
+    assert rec.get('cancel_after_driver_ready') is True
+    thread.join(3)
+    assert not thread.is_alive() and rec.get('driver_ready') is True
+    # Repeated API cancellation and the watchdog before/after readiness send
+    # exactly one SIGTERM to the initialized driver.
+    rs._kill_capped(proc,rec)
+    assert len(stops) == 1 and rec.get('stop_signal_sent') is True

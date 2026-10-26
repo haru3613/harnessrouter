@@ -413,7 +413,9 @@ def test_the_runner_is_given_the_history_on_every_backend(monkeypatch, backend):
         return ([], [], [], [], [])
 
     async def harness_env(*_a, **_kw):
-        return ({}, [])
+        # Herdr has no implicit filesystem project: its registered alias is a
+        # required literal even when this test only observes the Runner prompt.
+        return ({"HARU_WORKSPACE": "fixture"} if backend == "herdr" else {}, [])
 
     async def auth_from_conn(*_a, **_kw):
         return {"token": "t", "base_url": "https://proxy.example/v1"}
@@ -451,7 +453,8 @@ def test_the_runner_is_given_the_history_on_every_backend(monkeypatch, backend):
     tr = gw._RespTranslator(f"resp_hist{backend}", "m", None, True, time.time(), sid=sid)
     _st, _pr, _rec = asyncio.run(_REAL_EXECUTE(tr, org="org.forks", member="m", sid=sid, backend=backend, chain=["c1"],
                               prompt=prompt, files_in=[], resume=None, emit=lambda ev: asyncio.sleep(0),
-                              user_text=NEW))
+                              user_text=NEW,
+                              hv={"base": "herdr", "env": '{"HARU_WORKSPACE":"fixture"}'} if backend == "herdr" else None))
     assert len(seen) == 1, f"{backend}: the turn never reached the runner's /turn: {_st} {str(_rec)[:600]}"
     assert seen[0]["prompt"] == prompt
     assert f"user: {REQUEST}\nassistant: {ANSWER}\n" in seen[0]["prompt"]

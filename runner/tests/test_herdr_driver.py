@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import signal
 import sys
 import tempfile
 import unittest
@@ -26,6 +27,12 @@ class FakeClient:
             return {"task": {"id": "task-1", "execution_state": "queued"}}
         if name == "get_task":
             return {"task": self.tasks.pop(0) if self.tasks else {"id": "task-1", "execution_state": "succeeded", "result": "done"}}
+        if name == "get_route_task":
+            return {"task": self.tasks.pop(0) if self.tasks else {"id": args["task_id"], "workspace": "fixture", "requested_provider": "codex", "router_harness_id": "herdr-1", "execution_state": "waiting_route"}}
+        if name == "activate_route_task":
+            return {"task": {"id": args["task_id"], "execution_state": "succeeded", "result": "adopted"}}
+        if name == "cancel_route_task":
+            return {"task": {"id": args["task_id"]}}
         if name == "cancel_session_task":
             return {"task": {"id": "task-1"}}
         raise AssertionError(name)
@@ -96,6 +103,28 @@ class HerdrDriverTests(unittest.TestCase):
         self.assertEqual(turn.cancel(), "remote_stop_unknown")
         self.assertEqual([name for name, _ in turn.client.calls[-2:]], ["get_task", "cancel_session_task"])
         turn.close()
+
+    def test_driver_ready_is_emitted_only_after_turn_exists_and_signal_cancels_it(self):
+        job = self.cwd / "driver-job.json"; job.write_text("{}")
+        events, calls = [], []
+        class FakeTurn:
+            def __init__(self, raw): calls.append(("constructed", raw))
+            def run(self):
+                os.kill(os.getpid(), signal.SIGTERM)
+            def cancel(self):
+                calls.append(("cancel",)); return "remote_stop_unknown"
+        old_handler = signal.getsignal(signal.SIGTERM)
+        old_turn, old_emit = hd.Turn, hd._emit
+        try:
+            hd.Turn = FakeTurn
+            hd._emit = lambda method, payload: events.append((method, dict(payload)))
+            self.assertEqual(hd.main([str(job)]), 0)
+        finally:
+            hd.Turn, hd._emit = old_turn, old_emit
+            signal.signal(signal.SIGTERM, old_handler)
+        self.assertEqual(calls[0][0], "constructed")
+        self.assertEqual(events[0][0], "__hr_ready")
+        self.assertIn(("cancel",), calls)
 
     def test_rejects_paths_unsupported_inputs_and_bad_endpoint(self):
         for changes in ({"workspace": "/tmp/x"}, {"files": [{"x": 1}]}, {"base_url": "http://dispatch.example/mcp"},
@@ -231,6 +260,84 @@ class HerdrDriverTests(unittest.TestCase):
         refused.run()
         self.assertEqual(self.events[-1][1]["status"], "failed")
         self.assertFalse(any(name == "submit_session_task" for name, _ in refused.client.calls))
+
+    def test_adoption_activates_exact_task_without_submitting_and_waiting_input_stays_live(self):
+        route = {"task_id": "task-route", "fingerprint": "a" * 64, "response_id": "resp-1",
+                 "harness_id": "herdr-1", "capability_sha256": "b" * 64}
+        env = {"HARU_WORKSPACE": "fixture", "HR_HERDR_TOKEN": "router-token",
+               "HR_HARU_ROUTE_CAPABILITY": "capability_123456789"}
+        events = []
+        job = self.job(request_id="adopt", haru_route=route)
+        class WaitingClient(FakeClient):
+            def call(self, name, args):
+                if name == "activate_route_task":
+                    self.calls.append((name, dict(args)))
+                    return {"task": {"id": args["task_id"], "workspace": "fixture", "execution_state": "waiting_input"}}
+                return super().call(name, args)
+        def waiting_factory(*args, **kwargs):
+            client = WaitingClient(*args, **kwargs); self.clients.append(client); return client
+        turn = hd.Turn(job, environ=env, client_factory=waiting_factory,
+                       emit=lambda m, p: events.append((m, p)), now=iter([0, 99]).__next__, sleep=lambda _: None)
+        turn.client.tasks = [{"id": "task-route", "workspace": "fixture", "requested_provider": "codex", "router_harness_id": "herdr-1", "execution_state": "waiting_input"}]
+        turn.run()
+        names = [name for name, _ in turn.client.calls]
+        self.assertIn("get_route_task", names)
+        self.assertIn("activate_route_task", names)
+        self.assertNotIn("submit_session_task", names)
+        self.assertNotIn("get_task", names)
+        self.assertEqual(events[-1][1]["status"], "incomplete")  # observation cap, not fake task terminal
+
+    def test_adoption_does_not_recompose_an_existing_host_task(self):
+        route = {"task_id": "task-route", "fingerprint": "a" * 64, "response_id": "resp-1",
+                 "harness_id": "herdr-1", "capability_sha256": "b" * 64}
+        env = {"HARU_WORKSPACE": "fixture", "HR_HERDR_TOKEN": "router-token",
+               "HR_HARU_ROUTE_CAPABILITY": "capability_123456789"}
+        # New Response inputs may exceed HARU's 16KiB limit; adoption must not
+        # reinterpret them because HARU has already frozen the original task.
+        job = self.job(request_id="adopt-large", prompt="x" * (17 * 1024), agent_doc="y" * (64 * 1024), haru_route=route)
+        turn = hd.Turn(job, environ=env, client_factory=self.factory,
+                       emit=lambda *_: None, now=lambda: 0, sleep=lambda _: None)
+        self.assertEqual(turn.payload["_haru_route"]["task_id"], "task-route")
+        turn.close()
+
+    def test_adoption_refuses_harness_or_provider_mismatch(self):
+        route = {"task_id": "task-route", "fingerprint": "a" * 64, "response_id": "resp-1",
+                 "harness_id": "herdr-1", "capability_sha256": "b" * 64}
+        env = {"HARU_WORKSPACE": "fixture", "HR_HERDR_TOKEN": "router-token",
+               "HR_HARU_ROUTE_CAPABILITY": "capability_123456789"}
+        turn = hd.Turn(self.job(request_id="adopt-bad", haru_route=route), environ=env,
+                       client_factory=self.factory, emit=lambda *_: None, now=lambda: 0, sleep=lambda _: None)
+        turn.client.tasks = [{"id": "task-route", "workspace": "fixture", "requested_provider": "claude", "router_harness_id": "wrong", "execution_state": "waiting_route"}]
+        self.assertEqual(turn.run(), 0)
+        self.assertFalse(any(name == "activate_route_task" for name, _ in turn.client.calls))
+
+    def test_adoption_cancel_before_activation_uses_descriptor_task_without_submit(self):
+        route = {"task_id": "task-route", "fingerprint": "a" * 64, "response_id": "resp-1",
+                 "harness_id": "herdr-1", "capability_sha256": "b" * 64}
+        env = {"HARU_WORKSPACE": "fixture", "HR_HERDR_TOKEN": "router-token",
+               "HR_HARU_ROUTE_CAPABILITY": "capability_123456789"}
+        turn = hd.Turn(self.job(request_id="adopt-cancel", haru_route=route), environ=env,
+                       client_factory=self.factory, emit=lambda *_: None, now=lambda: 0, sleep=lambda _: None)
+        self.assertEqual(turn.cancel(), "remote_stop_unknown")
+        names = [name for name, _ in turn.client.calls]
+        self.assertEqual(names, ["get_route_task", "cancel_route_task"])
+        self.assertNotIn("activate_route_task", names)
+        self.assertNotIn("submit_session_task", names)
+        turn.close()
+
+    def test_adoption_cancel_after_lost_activation_reply_still_targets_descriptor_task(self):
+        route = {"task_id": "task-route", "fingerprint": "a" * 64, "response_id": "resp-1",
+                 "harness_id": "herdr-1", "capability_sha256": "b" * 64}
+        env = {"HARU_WORKSPACE": "fixture", "HR_HERDR_TOKEN": "router-token",
+               "HR_HARU_ROUTE_CAPABILITY": "capability_123456789"}
+        turn = hd.Turn(self.job(request_id="adopt-lost", haru_route=route), environ=env,
+                       client_factory=self.factory, emit=lambda *_: None, now=lambda: 0, sleep=lambda _: None)
+        turn.state["submission_attempted"] = True  # activate RPC may have reached HARU before reply loss
+        turn._save()
+        self.assertEqual(turn.cancel(), "remote_stop_unknown")
+        names = [name for name, _ in turn.client.calls]
+        self.assertEqual(names, ["get_route_task", "cancel_route_task"])
+        turn.close()
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import hmac
 
 PROVIDERS = {'local_subscription'}
 MODELS = ('haru-auto', 'haru-codex', 'haru-claude')
@@ -28,8 +29,34 @@ def validate_request(req) -> None:
         raise ValueError('HARU_WORKSPACE must be a literal alias, never a secret or header reference')
 
 
+def _route_verify(descriptor, capability: object) -> dict:
+    """Verify the Gateway-only adoption grant before exposing its capability."""
+    if not isinstance(descriptor, dict) or not isinstance(capability, str):
+        raise ValueError('HARU route adoption grant is unavailable')
+    keys = {'task_id', 'fingerprint', 'response_id', 'harness_id', 'capability_sha256', 'proof'}
+    if set(descriptor) != keys:
+        raise ValueError('HARU route adoption descriptor is invalid')
+    task, fingerprint, response, harness, capsha, proof = (descriptor[k] for k in ('task_id', 'fingerprint', 'response_id', 'harness_id', 'capability_sha256', 'proof'))
+    if not all(isinstance(v, str) for v in (task, fingerprint, response, harness, capsha, proof)):
+        raise ValueError('HARU route adoption descriptor is invalid')
+    if (not _ALIAS.fullmatch(task) or not _ALIAS.fullmatch(response) or not _ALIAS.fullmatch(harness) or
+            not re.fullmatch(r'[0-9a-f]{64}', fingerprint) or not re.fullmatch(r'[0-9a-f]{64}', capsha) or
+            not re.fullmatch(r'[0-9a-f]{64}', proof)):
+        raise ValueError('HARU route adoption descriptor is invalid')
+    key = os.environ.get('HARNESS_INTERNAL_KEY', '')
+    if not hmac.compare_digest(capsha, hashlib.sha256(capability.encode()).hexdigest()):
+        raise ValueError('HARU route capability verification failed')
+    payload = json.dumps({'task_id':task,'fingerprint':fingerprint,'response_id':response,
+                          'harness_id':harness,'capability_sha256':capsha}, sort_keys=True, separators=(',', ':')).encode()
+    expected = hmac.new(key.encode(), payload, hashlib.sha256).hexdigest() if key else ''
+    if not expected or not hmac.compare_digest(expected, proof):
+        raise ValueError('HARU route adoption descriptor verification failed')
+    return {'task_id': task, 'fingerprint': fingerprint, 'response_id': response,
+            'harness_id': harness, 'capability_sha256': capsha}
+
+
 def build_command(provider, auth, model, prompt, cwd, env, *, workspace, request_key,
-                  resume_session_id=None, agent_doc='', timeout_seconds=600):
+                  resume_session_id=None, agent_doc='', timeout_seconds=600, haru_route=None):
     from herdr_driver import compose_task, validate_endpoint
     if provider != 'local_subscription':
         raise ValueError('Herdr requires local_subscription; API provider fallback is forbidden')
@@ -38,7 +65,11 @@ def build_command(provider, auth, model, prompt, cwd, env, *, workspace, request
     if (not isinstance(workspace,str) or not _ALIAS.fullmatch(workspace) or
             workspace.lower().startswith(('vault:', 'secret:'))):
         raise ValueError('HARU_WORKSPACE must be a registered workspace alias, never a path')
-    compose_task(prompt, agent_doc or '')  # validate the combined host limit before persistence
+    # A normal Response becomes a new HARU task and must fit that host's
+    # prompt limit. An adoption never submits this reconstructed prompt: HARU's
+    # already-staged source task is the sole authority for task text/contract.
+    if haru_route is None:
+        compose_task(prompt, agent_doc or '')
     token = getattr(auth, 'api_key', None)
     if not isinstance(token,str) or not token.strip():
         raise ValueError('A scoped Dispatch access token is required')
@@ -61,6 +92,13 @@ def build_command(provider, auth, model, prompt, cwd, env, *, workspace, request
     job={'cwd':str(root),'prompt':prompt,'agent_doc':agent_doc or '', 'model':model,
          'workspace':workspace,'base_url':endpoint,'request_id':request_id,
          'resume_session_id':resume_session_id or '', 'timeout_seconds':timeout_seconds}
+    if haru_route is not None:
+        expected_endpoint = str(env.get('HR_HARU_ROUTE_MCP_ENDPOINT') or '')
+        if not expected_endpoint or endpoint != validate_endpoint(expected_endpoint):
+            raise ValueError('HARU route must use the operator-pinned Dispatch MCP endpoint')
+        capability = env.get('HR_HARU_ROUTE_CAPABILITY')
+        # Persist identifiers only. Capability stays in process memory/env.
+        job['haru_route'] = _route_verify(haru_route, capability)
     path=jobs/(request_id+'.json');encoded=json.dumps(job,sort_keys=True,ensure_ascii=False)
     if path.exists():
         if path.is_symlink() or path.read_text()!=encoded:

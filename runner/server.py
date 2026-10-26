@@ -11927,9 +11927,28 @@ def _stop_proc(proc: subprocess.Popen, rec: dict) -> None:
     _kill_proc_tree(proc, str(rec.get("turn_id") or ""))
 
 
+def _request_stop_proc(proc: subprocess.Popen, rec: dict) -> bool:
+    """Request a stop without racing Herdr driver's source-cancel handler.
+
+    Returns whether a signal was sent.  Herdr emits ``__hr_ready`` only after
+    constructing its Turn; callers before then leave a durable pending stop
+    that the reader consumes atomically on that frame.
+    """
+    if str(rec.get("backend") or "") == "herdr":
+        with _turns_lock:
+            if rec.get("stop_signal_sent"):
+                return False
+            if not rec.get("driver_ready"):
+                rec["cancel_after_driver_ready"] = True
+                return False
+            rec["stop_signal_sent"] = True
+    _stop_proc(proc, rec)
+    return True
+
+
 def _kill_capped(proc: subprocess.Popen, rec: dict) -> None:
     rec["capped"] = True
-    _stop_proc(proc, rec)
+    _request_stop_proc(proc, rec)
 
 
 # Bases whose runner builders take NO step-budget flag of their own: the generic counter in
@@ -12019,7 +12038,7 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
     rec["pid"] = proc.pid
     rec["proc"] = proc   # live handle so POST /turn/{id}/cancel can kill on demand
     if rec.get("cancelled"):
-        _kill_proc_tree(proc, turn_id)   # Stop raced the spawn — kill immediately, not at pipe EOF
+        _request_stop_proc(proc, rec)
     # Hard wall-clock cap — the caller's timeout_seconds (harness config / request override),
     # bounded by the global MAX_TURN_SECONDS ceiling (resource abuse backstop).
     cap = min(timeout_seconds, MAX_TURN_SECONDS) if timeout_seconds else MAX_TURN_SECONDS
@@ -12053,6 +12072,16 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
                 obj = json.loads(raw)
             except Exception:  # noqa: BLE001
                 continue
+            if obj.get("m") == "__hr_ready":
+                with _turns_lock:
+                    rec["driver_ready"] = True
+                    pending = bool(rec.pop("cancel_after_driver_ready", False))
+                    send_stop = pending and not rec.get("stop_signal_sent")
+                    if send_stop:
+                        rec["stop_signal_sent"] = True
+                if send_stop and proc.poll() is None:
+                    _stop_proc(proc, rec)
+                continue
             for ev in normalize(obj, state):
                 _settle(ev)
                 if ev.get("type") == "result":
@@ -12077,7 +12106,7 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
                 # remote runtime is cancelled too, and the turn is incomplete at its budget rather
                 # than running to the cap.
                 state["_stopped"] = True
-                _stop_proc(proc, rec)
+                _request_stop_proc(proc, rec)
         rc = proc.wait()
     finally:
         killer.cancel()
@@ -13623,6 +13652,8 @@ class TurnReq(BaseModel):
                                            # which knows it when the base here is a broker's; unset = read it off the base
     traceparent: str | None = None          # the caller's W3C trace context (#473); unset = the turn has none
     tracestate: str | None = None           # its vendor state for that trace; never `baggage`
+    haru_route: dict | None = None          # Gateway-signed adoption descriptor; never public caller metadata
+    haru_route_capability: str | None = None # private env delivery, never job/trace
 
 
 @app.post("/turn")
@@ -13647,6 +13678,8 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
     spec = BACKENDS.get(backend)
     if not spec:
         raise HTTPException(400, f"unknown backend '{backend}' (one of {sorted(BACKENDS)})")
+    if (req.haru_route is not None or req.haru_route_capability is not None) and backend != "herdr":
+        raise HTTPException(400, "HARU route adoption is only valid for the herdr backend")
     if backend == "herdr":
         try:
             herdr_backend.validate_request(req)
@@ -13887,12 +13920,15 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
     elif backend == "herdr":
         model = model or herdr_backend.DEFAULT_MODEL
         try:
+            if req.haru_route is not None:
+                env["HR_HARU_ROUTE_CAPABILITY"] = str(req.haru_route_capability or "")
             cmd = herdr_backend.build_command(
                 req.provider, auth, model, req.prompt, cwd, env,
                 workspace=(req.env or {}).get("HARU_WORKSPACE"),
                 request_key=identifier + ":" + (key or uuid.uuid4().hex),
                 resume_session_id=req.resume_session_id,
                 agent_doc=agent_doc, timeout_seconds=req.timeout_seconds or 600,
+                haru_route=req.haru_route,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
@@ -14148,7 +14184,7 @@ def cancel_turn(turn_id: str) -> dict:
     if proc is not None:
         if (BACKENDS.get(str(rec.get("backend") or "")) or {}).get("remote"):
             # the grace is waited on a thread of its own, so this answer is not held for it
-            threading.Thread(target=_stop_proc, args=(proc, rec), daemon=True).start()
+            threading.Thread(target=_request_stop_proc, args=(proc, rec), daemon=True).start()
         else:
             _kill_proc_tree(proc, turn_id)
     return {"turn_id": turn_id, "status": "cancelling", "cancelled": True}

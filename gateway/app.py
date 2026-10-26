@@ -58,6 +58,7 @@ import sql_plane             # the read-only SQL data plane (gate, row cap, intr
 import control_store  # durable transactional control state (idempotency / lease / monotonic cancel)
 import setup_compose         # New setup: the rules every built configuration is held to
 import setup_builder         # New setup: the built-in builder, saving into the person's workspace
+import haru_route            # private staged HARU route adoption; never public metadata
 
 POOL_ENDPOINT = os.environ.get("POOL_MGMT_ENDPOINT", "").rstrip("/")
 VAULT_URL = os.environ.get("VAULT_URL", "").rstrip("/")
@@ -1932,6 +1933,42 @@ async def _mapped_integration_conn(backend: str, canonical: str) -> dict | None:
     if pid:
         conn["model"] = pid
         conn["_model_resolved"] = True   # skip _map_model — the id is already provider-native
+    return conn
+
+
+async def _haru_route_integration_conn(backend: str, canonical: str) -> dict | None:
+    """Build the sole integration allowed to receive a HARU route capability.
+
+    Route adoption intentionally ignores the global model map and chain
+    fallbacks: a changed map must never direct the capability to a different
+    endpoint.
+    """
+    name = os.environ.get("HR_HARU_ROUTE_INTEGRATION", "").strip()
+    endpoint = os.environ.get("HR_HARU_ROUTE_MCP_ENDPOINT", "").strip()
+    if not name or _local_subscription_endpoint_error(endpoint):
+        return None
+    integ = next((item for item in await _integrations_doc()
+                  if str(item.get("name") or "") == name), None)
+    if not integ or str(integ.get("provider") or "").lower() != "local_subscription":
+        return None
+    config = integ.get("config") if isinstance(integ.get("config"), dict) else {}
+    if str(config.get("base_url") or "") != endpoint:
+        return None
+    if _INTEGRATION_WIRING.get(("local_subscription", backend)) != "local_subscription":
+        return None
+    models = _integration_models(integ)
+    pid = (models.get(canonical) or models.get(canonical.lower())) if canonical else ""
+    if canonical and not pid:
+        return None
+    # Do not spread arbitrary integration config here: a poisoned saved
+    # `backend` or `provider` must not override this adoption pin.
+    conn = {"name": f"integration:{name}", "backend": backend, "provider": "local_subscription"}
+    for field in ("base_url", "api_key"):
+        if config.get(field) not in (None, ""):
+            conn[field] = config[field]
+    if pid:
+        conn["model"] = pid
+        conn["_model_resolved"] = True
     return conn
 
 
@@ -8996,7 +9033,9 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                         codex_appserver: bool = False,
                         hv: dict | None = None,
                         environment: dict | None = None,
-                        trace_ctx: dict | None = None) -> tuple[str, list[dict], dict]:
+                        trace_ctx: dict | None = None,
+                        haru_route_descriptor: dict | None = None,
+                        haru_route_capability: str = "") -> tuple[str, list[dict], dict]:
     """Hydrate → run turn over the connection chain → translate events to `emit` → collect produced
     files → checkpoint + persist trace. Returns (status, produced_files, rec).
     model_req: the caller-selected model (honored over the connection default when provided)."""
@@ -9122,11 +9161,21 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
             runner_prompt = _history_prompt(_hist, prompt)
         except Exception:  # noqa: BLE001
             pass
-    # Model→integration mapping (global token-provider routing): a mapped model runs on its
-    # integration FIRST; the backend's policy chain stays as the failure fallback.
-    mapped_conn = await _mapped_integration_conn(backend, model_req)
-    candidates: list[tuple[str, dict | None]] = ([(mapped_conn["name"], mapped_conn)] if mapped_conn else [])
-    candidates += [(n, None) for n in chain]
+    # A staged HARU adoption is bound to one named, endpoint-pinned
+    # local_subscription integration. It never enters the global model-map or
+    # fallback chain, either of which could otherwise receive its capability.
+    if haru_route_descriptor is not None:
+        pinned = await _haru_route_integration_conn(backend, model_req)
+        candidates: list[tuple[str, dict | None]] = ([(pinned["name"], pinned)] if pinned else [])
+        if not pinned:
+            rec["tried"].append({"connection": "haru-route", "status": "refused",
+                                  "error": "HARU route integration is unavailable or no longer pinned"})
+    else:
+        # Model→integration mapping (global token-provider routing): a mapped model runs on its
+        # integration FIRST; the backend's policy chain stays as the failure fallback.
+        mapped_conn = await _mapped_integration_conn(backend, model_req)
+        candidates = ([(mapped_conn["name"], mapped_conn)] if mapped_conn else [])
+        candidates += [(n, None) for n in chain]
     if backend == "codex" and model_req:
         # The session remembers every model it has run. A gpt-5.3-codex turn after another model
         # family is refused, in words, rather than run without its tools or restarted on a fresh
@@ -9245,6 +9294,10 @@ async def _resp_execute(translator: _RespTranslator, *, org: str, member: str, s
                 # environment and gives the model calls a child of it. Empty when the caller sent
                 # none, so a turn without a trace context sends none.
                 **(trace_ctx or {})}
+        if haru_route_descriptor is not None:
+            # Private Runner request only; neither value joins prompt, trace, response or metadata.
+            body["haru_route"] = haru_route_descriptor
+            body["haru_route_capability"] = haru_route_capability
         if await _past_cap_stand_down(sid, translator, rec):
             status = "failed"
             break
@@ -10223,6 +10276,11 @@ async def create_response(body: CreateResponseBody, request: Request):
     if not org:
         raise HTTPException(400, "no org resolved for this principal")
     meta = body.metadata or {}
+    bearer = (request.headers.get("authorization") or "").removeprefix("Bearer ").removeprefix("bearer ").strip()
+    try:
+        route_claim = haru_route.incoming(request.headers, bearer)
+    except haru_route.RouteError as exc:
+        raise uhp_error(403, "forbidden", str(exc)) from None
     probe = {"systemone": meta["systemone"]} if isinstance(meta.get("systemone"), dict) else None
     # harness id: request metadata, else the X-Harness-Id header (set by a front proxy that maps
     # {harness_id}/v1/* -> /v1/*, or by the native public-shape route above).
@@ -10238,6 +10296,23 @@ async def create_response(body: CreateResponseBody, request: Request):
         _pv = await _vertex_get(_psid) if _psid else None
         harness_id = str((_pv or {}).get("harness_id") or "")
     harness_name = str(meta.get("harness_name") or "")
+    route_hv = None
+    if route_claim is not None:
+        # Do not let a Console/BFF internal identity mask a revoked or differently
+        # scoped route key. This second resolve is the authority for adoption.
+        route_principal = await _apikey_resolve(bearer)
+        expected_workspace = os.environ.get("HR_HARU_ROUTE_WORKSPACE", "")
+        allowed = {value.strip() for value in os.environ.get("HR_HARU_ROUTE_HARNESSES", "").split(",") if value.strip()}
+        if not haru_route.scope_authorized(route_principal, org=org, workspace=expected_workspace,
+                                           harness_id=harness_id, allowed_harnesses=allowed):
+            raise uhp_error(403, "forbidden", "HARU route API key is revoked or outside its configured scope.")
+        route_hv = await _harness_vertex(harness_id)
+        _turn_harness_check(harness_id, route_hv)
+        _turn_harness_owned(route_principal, route_hv)
+        if _backend_of_harness(route_hv) != "herdr":
+            raise uhp_error(403, "forbidden", "This HARU route is not authorized for the selected harness.")
+        if body.previous_response_id or meta.get("session_id"):
+            raise uhp_error(400, "invalid_request", "HARU route adoption does not accept a caller-selected continuation.")
     # A calibration credential is held to its one harness HERE, before the idempotency replay below
     # hands back a stored response and before any session is touched: a refusal that comes after a
     # read or a write is not a refusal. It starts runs on that harness, and continues only a
@@ -10266,6 +10341,13 @@ async def create_response(body: CreateResponseBody, request: Request):
             raise HTTPException(503, "idempotency store unavailable; retry")
         idem_sha_v = _idem_sha(idem_key)
         idem_rhash = _req_hash(body)
+        if route_claim is not None:
+            # A retry is equivalent only when it adopts the exact same HARU task.
+            idem_rhash = hashlib.sha256(json.dumps({"request": idem_rhash,
+                "route": {"task_id": route_claim["task_id"], "fingerprint": route_claim["fingerprint"],
+                           "harness_id": harness_id,
+                           "capability_sha256": hashlib.sha256(route_claim["capability"].encode()).hexdigest()}},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         try:
             existing = await control_store.idem_get(org, idem_sha_v)
         except Exception as e:  # noqa: BLE001
@@ -10274,7 +10356,7 @@ async def create_response(body: CreateResponseBody, request: Request):
             if str(existing.get("req_hash") or "") not in ("", idem_rhash):
                 raise HTTPException(409, "Idempotency-Key reused with a different request payload")
             return await _idem_replay(str(existing.get("resp_id") or ""), bool(body.stream))
-    hv = await _harness_vertex(harness_id) if harness_id else None
+    hv = route_hv if route_claim is not None else (await _harness_vertex(harness_id) if harness_id else None)
     # A deleted harness cannot run new turns (same 404 as the read endpoints), and a harness runs
     # only for the organization and workspace that own it: see _turn_harness_owned.
     _turn_harness_check(harness_id, hv)
@@ -10339,6 +10421,8 @@ async def create_response(body: CreateResponseBody, request: Request):
     # harness's fixed backend, not allowed to silently re-route to a different one.
     backend = (_backend_of_harness(hv) or _backend_of_builtin(harness_id)
                or _route_backend(model_req or body.model, body.backend))
+    if route_claim is not None and backend != "herdr":
+        raise uhp_error(403, "forbidden", "This HARU route is not authorized for the selected harness.")
     # Server-side model permission (CT-124): a model this backend cannot serve is refused here.
     model_req = await _resolve_model_policy(model_req, hv, backend, org)
     want_partial = _want_partial(backend, meta)
@@ -10348,12 +10432,14 @@ async def create_response(body: CreateResponseBody, request: Request):
     want_appserver = (backend == "codex" and (
         os.environ.get("HARNESS_CODEX_APPSERVER", "0") == "1" or bool(meta.get("codex_appserver"))))
     chain = await _resolve_chain(org, backend, None)
+    if route_claim is not None and not await _haru_route_integration_conn(backend, model_req):
+        raise uhp_error(403, "forbidden", "The HARU route integration is not pinned to its configured endpoint.")
     # The chain is the FALLBACK, not the entry condition: a model mapped to an integration runs on
     # that integration first (see the candidate list in _resp_execute). Requiring a policy chain
     # here rejected the turn before the executor could ever reach the integration — so a user who
     # had just added their own key was told there was no connection for the backend, which was
     # both wrong and unactionable. Only refuse when NOTHING can serve it.
-    if not chain and not await _mapped_integration_conn(backend, model_req):
+    if route_claim is None and not chain and not await _mapped_integration_conn(backend, model_req):
         raise HTTPException(400, f"no provider configured for backend '{backend}'. Add an "
                                  f"integration for a provider that serves '{model_req or backend}', "
                                  f"or configure a connection policy")
@@ -10444,6 +10530,12 @@ async def create_response(body: CreateResponseBody, request: Request):
     if _bt is not None:
         _bt["billing_org"] = billing_org
     resp_id = _rid("resp")
+    route_descriptor = None
+    if route_claim is not None:
+        try:
+            route_descriptor = haru_route.sign(route_claim, resp_id, harness_id, INTERNAL_KEY)
+        except haru_route.RouteError as exc:
+            raise HTTPException(503, str(exc)) from None
     created_at = time.time()
     # Authoritative idempotency reservation (HR-INF-011): AFTER validation, BEFORE the turn
     # executes. One atomic create_item wins; a 409 means a concurrent/earlier request already
@@ -10567,7 +10659,8 @@ async def create_response(body: CreateResponseBody, request: Request):
                         model_req=model_req, user_text=user_text, harness_id=harness_id,
                         max_step=max_step, timeout_s=timeout_s, effort=effort, hdr_vals=hdr_vals,
                         partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment,
-                        trace_ctx=trace_ctx)
+                        trace_ctx=trace_ctx, haru_route_descriptor=route_descriptor,
+                        haru_route_capability=(route_claim or {}).get("capability", ""))
                     end["status"] = status
                     # A failed turn says why in the transcript, not only in the response record: fail()
                     # carries the message as an error event, which the console prints under the answer.
@@ -10622,7 +10715,8 @@ async def create_response(body: CreateResponseBody, request: Request):
                             prompt=prompt, files_in=files_in, resume=resume, emit=emit, model_req=model_req,
                             user_text=user_text, harness_id=harness_id, max_step=max_step,
                             timeout_s=timeout_s, effort=effort, hdr_vals=hdr_vals, partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment,
-                            trace_ctx=trace_ctx)
+                            trace_ctx=trace_ctx, haru_route_descriptor=route_descriptor,
+                            haru_route_capability=(route_claim or {}).get("capability", ""))
                         end["status"] = status
                         # A failed turn says why in the transcript, not only in the response record: fail()
                         # carries the message as an error event, which the console prints under the answer.
@@ -10683,7 +10777,8 @@ async def create_response(body: CreateResponseBody, request: Request):
                 prompt=prompt, files_in=files_in, resume=resume, emit=bus_emit, model_req=model_req,
                 user_text=user_text, harness_id=harness_id, max_step=max_step,
                 timeout_s=timeout_s, effort=effort, hdr_vals=hdr_vals, partial_messages=want_partial, codex_appserver=want_appserver, hv=hv, probe=probe, environment=environment,
-                trace_ctx=trace_ctx)
+                trace_ctx=trace_ctx, haru_route_descriptor=route_descriptor,
+                haru_route_capability=(route_claim or {}).get("capability", ""))
             # A failed turn says why in the transcript, not only in the response record: fail()
             # carries the message as an error event, which the console prints under the answer.
             for ev in (_fail_events(tr, rec) if status == "failed" else tr.complete(status, produced)):
