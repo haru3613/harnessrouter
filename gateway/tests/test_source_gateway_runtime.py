@@ -89,6 +89,27 @@ def test_environment_revision_is_required_before_import(tmp_path, monkeypatch):
     assert not import_marker.exists()
 
 
+def test_state_root_symlink_is_rejected_before_compatibility_import(tmp_path, monkeypatch):
+    import_marker = tmp_path / "imported"
+    compat = build_compat(
+        tmp_path,
+        f'from pathlib import Path\nPath({str(import_marker)!r}).write_text("imported")\n'
+        "def main():\n    return None\n",
+    )
+    state = build_state(tmp_path, compat)
+    linked_state = tmp_path / "linked-state"
+    linked_state.symlink_to(state, target_is_directory=True)
+    monkeypatch.setenv("HARU_DISPATCH_STATE_DIR", str(linked_state))
+    monkeypatch.setenv("HR_DISPATCH_COMPAT_ROOT", str(compat))
+    monkeypatch.setenv("HR_DISPATCH_SOURCE_REVISION", REVISION)
+    _forget_fake_package()
+
+    with pytest.raises(StateValidationError, match="invalid state directory"):
+        runtime.main(["run"])
+
+    assert not import_marker.exists()
+
+
 def test_unknown_wrapper_command_never_preflights_or_imports(monkeypatch):
     called = False
 

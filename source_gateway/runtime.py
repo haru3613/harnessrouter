@@ -13,10 +13,10 @@ from .validation import StateValidationError, validate_state
 def _preflight() -> Path:
     # Use the compatibility package's own state variable so the validated path
     # and the path it later opens can never diverge.
-    state_dir = Path(os.environ.get("HARU_DISPATCH_STATE_DIR", "/state")).expanduser().resolve()
-    os.environ["HARU_DISPATCH_STATE_DIR"] = str(state_dir)
+    state_dir = Path(os.environ.get("HARU_DISPATCH_STATE_DIR", "/state")).expanduser()
     compat_root = Path(os.environ.get("HR_DISPATCH_COMPAT_ROOT", "/app/compat"))
     report = validate_state(state_dir, compat_root=compat_root)
+    os.environ["HARU_DISPATCH_STATE_DIR"] = str(state_dir.absolute())
     expected = os.environ.get("HR_DISPATCH_SOURCE_REVISION")
     if not expected or expected != report["source_revision"]:
         raise StateValidationError("source revision mismatch")

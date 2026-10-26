@@ -134,9 +134,10 @@ def artifact_tree_sha256(root: str | os.PathLike[str]) -> str:
 def _open_database(path: Path) -> sqlite3.Connection:
     _regular_file(path, "state database")
     try:
-        # immutable=1 prevents SQLite from creating journals or shared-memory
-        # files. Migration is required to checkpoint each database beforehand.
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro&immutable=1", uri=True)
+        # mode=ro prevents schema/data writes while still letting SQLite recover
+        # committed rows from an existing WAL. It may create ephemeral SHM
+        # metadata, but never initializes a database or compatibility key.
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
         return connection

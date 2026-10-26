@@ -111,6 +111,45 @@ def test_valid_state_preserves_baselines_and_cross_store_links(tmp_path):
     assert SECRET.decode() not in json.dumps(report)
 
 
+def test_valid_state_reads_committed_wal_rows_before_and_after_checkpoint(tmp_path):
+    compat = build_compat(tmp_path)
+    state = build_state(tmp_path, compat)
+    jobs = sqlite3.connect(state / "jobs.sqlite3")
+    bridge = sqlite3.connect(state / "bridge.sqlite3")
+    oauth = sqlite3.connect(state / "oauth.sqlite3")
+    connections = (jobs, bridge, oauth)
+    try:
+        for connection in connections:
+            assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            connection.execute("PRAGMA wal_autocheckpoint=0")
+        jobs.execute("INSERT INTO jobs VALUES(?)", ("job-from-wal",))
+        jobs.execute(
+            "INSERT INTO session_events VALUES(?,?,?,?)",
+            ("job-from-wal", "event-from-wal", "message-from-wal", 456.0),
+        )
+        bridge.execute(
+            "INSERT INTO messages VALUES(?,?)", ("message-from-wal", "job-from-wal")
+        )
+        oauth.execute("INSERT INTO clients VALUES(?)", ("client-from-wal",))
+        for connection in connections:
+            connection.commit()
+
+        report = validate_state(state, compat_root=compat)
+        assert report["job_count"] == 3
+        assert report["client_count"] == 3
+        assert report["published_event_count"] == 2
+    finally:
+        for connection in connections:
+            connection.close()
+
+    # Closing the writers checkpoints the WAL; restart validation must see the
+    # same committed state from the main database files.
+    report = validate_state(state, compat_root=compat)
+    assert report["job_count"] == 3
+    assert report["client_count"] == 3
+    assert report["published_event_count"] == 2
+
+
 @pytest.mark.parametrize("missing", ["jobs.sqlite3", "bridge.sqlite3", "oauth.sqlite3"])
 def test_missing_database_fails_without_initializing_it(tmp_path, missing):
     state = build_state(tmp_path)
