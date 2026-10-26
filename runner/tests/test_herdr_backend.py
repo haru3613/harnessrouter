@@ -3,6 +3,7 @@ import json
 import pathlib
 import sys
 import time
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -132,4 +133,27 @@ def test_pre_spawn_cancel_waits_for_herdr_driver_readiness(monkeypatch,tmp_path)
     rs._run_turn_bg('herdr-ready-race',[sys.executable,'-c',child],{},str(tmp_path),
                     lambda obj,state: [],'haru-codex',30)
     assert rec.get('driver_ready') is True
-    assert rec.get('cancel_after_driver_ready') is False
+    assert 'cancel_after_driver_ready' not in rec
+
+
+def test_api_cancel_after_popen_defers_until_herdr_ready(monkeypatch,tmp_path):
+    import server as rs
+    rec={'status':'running','events':[],'result':'','done':False,'started':time.time(),'backend':'herdr'}
+    monkeypatch.setitem(rs._turns,'herdr-api-race',rec)
+    monkeypatch.setattr(rs,'_REMOTE_STOP_GRACE_S',.2)
+    child=("import json,signal,time; "
+           "signal.signal(signal.SIGTERM,lambda *_:exit(0)); time.sleep(.25); "
+           "print(json.dumps({'m':'__hr_ready','p':{}}),flush=True); time.sleep(5)")
+    thread=threading.Thread(target=rs._run_turn_bg,args=('herdr-api-race',[sys.executable,'-c',child],{},str(tmp_path),lambda obj,state: [],'haru-codex',30))
+    thread.start()
+    for _ in range(100):
+        if rec.get('proc') is not None: break
+        time.sleep(.01)
+    assert rec.get('proc') is not None
+    assert rs.cancel_turn('herdr-api-race')['cancelled'] is True
+    for _ in range(100):
+        if rec.get('cancel_after_driver_ready'): break
+        time.sleep(.01)
+    assert rec.get('cancel_after_driver_ready') is True
+    thread.join(3)
+    assert not thread.is_alive() and rec.get('driver_ready') is True

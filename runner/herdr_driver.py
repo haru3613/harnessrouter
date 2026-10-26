@@ -588,11 +588,12 @@ def main(argv: list[str] | None = None) -> int:
     def on_term(_signum, _frame):  # noqa: ANN001
         raise KeyboardInterrupt
     # The runner waits for this readiness frame before signalling a cancellation
-    # that raced Popen, so SIGTERM cannot beat handler installation.
+    # that raced Popen.  Construct Turn first, so its cancellation owns an
+    # initialized source task/capability rather than reporting an unknown stop.
     signal.signal(signal.SIGTERM, on_term)
-    _emit("__hr_ready", {})
     try:
         turn = Turn(raw)
+        _emit("__hr_ready", {})
         return turn.run()
     except KeyboardInterrupt:
         reason = turn.cancel() if turn else "remote_stop_unknown"

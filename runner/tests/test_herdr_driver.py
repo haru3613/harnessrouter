@@ -1,6 +1,7 @@
 import json
 import os
 import pathlib
+import signal
 import sys
 import tempfile
 import unittest
@@ -102,6 +103,28 @@ class HerdrDriverTests(unittest.TestCase):
         self.assertEqual(turn.cancel(), "remote_stop_unknown")
         self.assertEqual([name for name, _ in turn.client.calls[-2:]], ["get_task", "cancel_session_task"])
         turn.close()
+
+    def test_driver_ready_is_emitted_only_after_turn_exists_and_signal_cancels_it(self):
+        job = self.cwd / "driver-job.json"; job.write_text("{}")
+        events, calls = [], []
+        class FakeTurn:
+            def __init__(self, raw): calls.append(("constructed", raw))
+            def run(self):
+                os.kill(os.getpid(), signal.SIGTERM)
+            def cancel(self):
+                calls.append(("cancel",)); return "remote_stop_unknown"
+        old_handler = signal.getsignal(signal.SIGTERM)
+        old_turn, old_emit = hd.Turn, hd._emit
+        try:
+            hd.Turn = FakeTurn
+            hd._emit = lambda method, payload: events.append((method, dict(payload)))
+            self.assertEqual(hd.main([str(job)]), 0)
+        finally:
+            hd.Turn, hd._emit = old_turn, old_emit
+            signal.signal(signal.SIGTERM, old_handler)
+        self.assertEqual(calls[0][0], "constructed")
+        self.assertEqual(events[0][0], "__hr_ready")
+        self.assertIn(("cancel",), calls)
 
     def test_rejects_paths_unsupported_inputs_and_bad_endpoint(self):
         for changes in ({"workspace": "/tmp/x"}, {"files": [{"x": 1}]}, {"base_url": "http://dispatch.example/mcp"},

@@ -11927,9 +11927,25 @@ def _stop_proc(proc: subprocess.Popen, rec: dict) -> None:
     _kill_proc_tree(proc, str(rec.get("turn_id") or ""))
 
 
+def _request_stop_proc(proc: subprocess.Popen, rec: dict) -> bool:
+    """Request a stop without racing Herdr driver's source-cancel handler.
+
+    Returns whether a signal was sent.  Herdr emits ``__hr_ready`` only after
+    constructing its Turn; callers before then leave a durable pending stop
+    that the reader consumes atomically on that frame.
+    """
+    if str(rec.get("backend") or "") == "herdr":
+        with _turns_lock:
+            if not rec.get("driver_ready"):
+                rec["cancel_after_driver_ready"] = True
+                return False
+    _stop_proc(proc, rec)
+    return True
+
+
 def _kill_capped(proc: subprocess.Popen, rec: dict) -> None:
     rec["capped"] = True
-    _stop_proc(proc, rec)
+    _request_stop_proc(proc, rec)
 
 
 # Bases whose runner builders take NO step-budget flag of their own: the generic counter in
@@ -12018,12 +12034,8 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
         return
     rec["pid"] = proc.pid
     rec["proc"] = proc   # live handle so POST /turn/{id}/cancel can kill on demand
-    if rec.get("cancelled") and str(rec.get("backend") or "") == "herdr":
-        # Do not race the driver's SIGTERM handler installation. Its ready
-        # frame below is when a graceful source cancellation becomes possible.
-        rec["cancel_after_driver_ready"] = True
-    elif rec.get("cancelled"):
-        _stop_proc(proc, rec)
+    if rec.get("cancelled"):
+        _request_stop_proc(proc, rec)
     # Hard wall-clock cap — the caller's timeout_seconds (harness config / request override),
     # bounded by the global MAX_TURN_SECONDS ceiling (resource abuse backstop).
     cap = min(timeout_seconds, MAX_TURN_SECONDS) if timeout_seconds else MAX_TURN_SECONDS
@@ -12058,9 +12070,10 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
             except Exception:  # noqa: BLE001
                 continue
             if obj.get("m") == "__hr_ready":
-                rec["driver_ready"] = True
-                if rec.get("cancel_after_driver_ready") and proc.poll() is None:
-                    rec["cancel_after_driver_ready"] = False
+                with _turns_lock:
+                    rec["driver_ready"] = True
+                    pending = bool(rec.pop("cancel_after_driver_ready", False))
+                if pending and proc.poll() is None:
                     _stop_proc(proc, rec)
                 continue
             for ev in normalize(obj, state):
@@ -12087,7 +12100,7 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
                 # remote runtime is cancelled too, and the turn is incomplete at its budget rather
                 # than running to the cap.
                 state["_stopped"] = True
-                _stop_proc(proc, rec)
+                _request_stop_proc(proc, rec)
         rc = proc.wait()
     finally:
         killer.cancel()
@@ -14165,7 +14178,7 @@ def cancel_turn(turn_id: str) -> dict:
     if proc is not None:
         if (BACKENDS.get(str(rec.get("backend") or "")) or {}).get("remote"):
             # the grace is waited on a thread of its own, so this answer is not held for it
-            threading.Thread(target=_stop_proc, args=(proc, rec), daemon=True).start()
+            threading.Thread(target=_request_stop_proc, args=(proc, rec), daemon=True).start()
         else:
             _kill_proc_tree(proc, turn_id)
     return {"turn_id": turn_id, "status": "cancelling", "cancelled": True}
