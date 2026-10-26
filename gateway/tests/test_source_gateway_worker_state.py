@@ -130,3 +130,33 @@ def test_target_appearing_before_promotion_is_preserved(tmp_path):
             pytest.raises(WorkerMigrationError, match='changed during'):
         migrate_worker_state(root, target, quiesced=True, pid_alive=lambda _: False)
     assert (target / 'owner.txt').read_text() == 'other writer'
+
+
+def test_claude_stdout_receipt_does_not_require_a_codex_output_file(tmp_path):
+    root, mapping = fixture(tmp_path)
+    mapping['provider'] = 'claude'
+    report = Path(mapping['report_path'])
+    value = json.loads(report.read_text())
+    value['provider'] = 'claude'
+    report.write_text(json.dumps(value))
+    mapping['accepted_receipt_sha256'] = hashlib.sha256(report.read_bytes()).hexdigest()
+    Path(mapping['provider_report_path']).unlink()
+    (root / 'session-worker-jobs/task-1.json').write_text(json.dumps(mapping))
+    before = report.read_bytes()
+    target = tmp_path / 'new'
+    result = migrate_worker_state(root, target, quiesced=True, pid_alive=lambda _: False)
+    copied = json.loads((target / 'session-worker-jobs/task-1.json').read_text())
+    assert Path(copied['report_path']).read_bytes() == before
+    assert copied['accepted_receipt_sha256'] == mapping['accepted_receipt_sha256']
+    assert not Path(copied['provider_report_path']).exists()
+    assert result['session_mappings'][0]['missing_optional_artifacts'] == ['provider_report_path']
+
+
+def test_missing_claude_output_still_requires_an_accepted_host_receipt(tmp_path):
+    root, mapping = fixture(tmp_path)
+    mapping['provider'] = 'claude'
+    mapping.pop('accepted_receipt_sha256')
+    Path(mapping['provider_report_path']).unlink()
+    (root / 'session-worker-jobs/task-1.json').write_text(json.dumps(mapping))
+    with pytest.raises(WorkerMigrationError):
+        migrate_worker_state(root, tmp_path / 'new', quiesced=True, pid_alive=lambda _: False)

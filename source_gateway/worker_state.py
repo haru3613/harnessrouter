@@ -80,9 +80,15 @@ def _checked_mapping(root: Path, path: Path, pid_alive: Callable[[int], bool]) -
             relative = candidate.relative_to(root)
         except ValueError as exc:
             raise WorkerMigrationError("worker locator is outside its state root") from exc
+        # Claude returns its provider envelope on stdout. The common signed
+        # host receipt is authoritative; its planned Codex-style output file
+        # is never created. Preserve that locator without inventing a file.
+        optional_claude_output = (field == "provider_report_path" and mapping.get("provider") == "claude"
+                                 and bool(mapping.get("accepted_receipt_sha256")))
         if (not candidate.is_absolute() or ".." in relative.parts or len(relative.parts) < 3
                 or relative.parts[:2] != ("session-worker-jobs", task_id)
-                or candidate.is_symlink() or not candidate.is_file()):
+                or candidate.is_symlink()
+                or (not candidate.is_file() and not (optional_claude_output and not candidate.exists()))):
             raise WorkerMigrationError("worker locator does not reference a private artifact")
         locators[field] = relative
     if locators and set(locators) != set(LOCATORS):
@@ -123,7 +129,9 @@ def inspect_worker_state(source: str | os.PathLike, *, pid_alive: Callable[[int]
     mappings = []
     for path in sorted(jobs.glob("*.json")):
         mapping, locators = _checked_mapping(root, path, pid_alive)
-        mappings.append({"task_id": mapping["id"], "locator_fields": sorted(locators)})
+        mappings.append({"task_id": mapping["id"], "locator_fields": sorted(locators),
+                         "missing_optional_artifacts": [field for field, relative in locators.items()
+                                                        if not (root / relative).exists()]})
     return {"session_mappings": mappings, "mapping_count": len(mappings),
             "legacy_state_excluded": ["mcp-worker-jobs", "tasks.sqlite3", "tasks", "locks"],
             "provider_processes_present": False}
