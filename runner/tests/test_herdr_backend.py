@@ -69,6 +69,22 @@ def test_events_distinguish_progress_result_and_unknown_stop():
     assert 'may still be running' in hb.normalize.eof({},1)[0]['result']
 
 
+def test_adoption_grant_never_writes_capability_to_job(tmp_path, monkeypatch):
+    import hmac
+    import hashlib
+    monkeypatch.setenv("HARNESS_INTERNAL_KEY", "internal")
+    cap = "capability_123456789"
+    payload = {"task_id":"task-1","fingerprint":"a" * 64,"response_id":"resp-1","harness_id":"herdr-1","capability_sha256":hashlib.sha256(cap.encode()).hexdigest()}
+    proof = hmac.new(b"internal", json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256).hexdigest()
+    env = {"HR_HARU_ROUTE_CAPABILITY":cap}
+    command = hb.build_command("local_subscription", SimpleNamespace(api_key="ordinary", base_url="https://x.test/mcp"),
+                               "haru-codex", "read", str(tmp_path), env, workspace="fixture", request_key="route",
+                               haru_route={**payload,"proof":proof})
+    job = json.loads(pathlib.Path(command[-1]).read_text())
+    assert cap not in json.dumps(job)
+    assert job["haru_route"] == payload
+
+
 def test_runner_registry_and_unsupported_input_refusal(monkeypatch,tmp_path):
     import server as rs
     from fastapi.testclient import TestClient

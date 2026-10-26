@@ -13623,6 +13623,8 @@ class TurnReq(BaseModel):
                                            # which knows it when the base here is a broker's; unset = read it off the base
     traceparent: str | None = None          # the caller's W3C trace context (#473); unset = the turn has none
     tracestate: str | None = None           # its vendor state for that trace; never `baggage`
+    haru_route: dict | None = None          # Gateway-signed adoption descriptor; never public caller metadata
+    haru_route_capability: str | None = None # private env delivery, never job/trace
 
 
 @app.post("/turn")
@@ -13887,12 +13889,15 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
     elif backend == "herdr":
         model = model or herdr_backend.DEFAULT_MODEL
         try:
+            if req.haru_route is not None:
+                env["HR_HARU_ROUTE_CAPABILITY"] = str(req.haru_route_capability or "")
             cmd = herdr_backend.build_command(
                 req.provider, auth, model, req.prompt, cwd, env,
                 workspace=(req.env or {}).get("HARU_WORKSPACE"),
                 request_key=identifier + ":" + (key or uuid.uuid4().hex),
                 resume_session_id=req.resume_session_id,
                 agent_doc=agent_doc, timeout_seconds=req.timeout_seconds or 600,
+                haru_route=req.haru_route,
             )
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None

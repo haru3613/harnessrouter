@@ -1,0 +1,17 @@
+# Pair with docker-compose.haru.yml. Only the route pump joins this private Docker network.
+services:
+  harnessrouter:
+    environment:
+      HARNESS_INTERNAL_KEY: ${HARU_INTERNAL_KEY:?Set a persistent internal service key}
+      HR_HARU_ROUTE_API_KEY_SHA256: ${HARU_ROUTE_API_KEY_SHA256:-}
+      HR_HARU_ROUTE_WORKSPACE: ${HARU_ROUTE_WORKSPACE:-}
+      HR_HARU_ROUTE_HARNESSES: ${HARU_ROUTE_HARNESSES:-}
+    networks:
+      default:
+      dispatch:
+        aliases:
+          - harnessrouter
+networks:
+  dispatch:
+    external: true
+    name: ${HARU_DISPATCH_NETWORK:-haru-dispatch_default}
