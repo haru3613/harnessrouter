@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 
 import pytest
@@ -148,6 +149,29 @@ def test_valid_state_reads_committed_wal_rows_before_and_after_checkpoint(tmp_pa
     assert report["job_count"] == 3
     assert report["client_count"] == 3
     assert report["published_event_count"] == 2
+
+
+def test_corrupt_wal_is_rejected_instead_of_silently_reading_stale_main_db(tmp_path):
+    compat = build_compat(tmp_path)
+    state = build_state(tmp_path, compat)
+    writer = sqlite3.connect(state / "jobs.sqlite3")
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute("INSERT INTO jobs VALUES(?)", ("committed-only-in-wal",))
+        writer.commit()
+        recovered = tmp_path / "recovered"
+        shutil.copytree(state, recovered)
+    finally:
+        writer.close()
+
+    wal = recovered / "jobs.sqlite3-wal"
+    data = bytearray(wal.read_bytes())
+    data[:32] = b"X" * 32
+    wal.write_bytes(data)
+
+    with pytest.raises(StateValidationError, match="database WAL validation failed"):
+        validate_state(recovered, compat_root=compat)
 
 
 @pytest.mark.parametrize("missing", ["jobs.sqlite3", "bridge.sqlite3", "oauth.sqlite3"])
