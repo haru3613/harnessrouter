@@ -95,3 +95,24 @@ The source service starts with a 256 MiB limit. Lower it only after measured pea
 and steady-state receipts. Its ingress network is shared with the tunnel only;
 its route network is shared with HarnessRouter only. The tunnel never joins the
 internal route network.
+
+## Operator checks learned during cutover
+
+An offline WAL-mode database on a read-only Docker mount may still need SQLite
+journal metadata before `mode=ro` can open it. Keep the authoritative source
+mount read-only, copy the entire fenced tree into a private writable scratch
+directory, and compare every copied file hash before opening SQLite. Import from
+that frozen scratch tree and verify the original tree hashes again afterward.
+Include WAL/SHM files in the frozen copy when present; let SQLite interpret them.
+The scratch copy does not replace the offline archive or identity checks.
+
+Probe Gateway health either inside its container on loopback port 8080 or through
+the Console's `/api/harness/healthz` with the existing bearer key. An unauthenticated
+Console `401` is expected and is not evidence of an unhealthy Gateway.
+
+Fence the old worker's parent PID as well as all its descendants, not merely its
+launchd label. Pin and recheck the staged new plist before bootstrap. Write backup
+archives to unique attempt paths, validate and fsync them, then publish; retries
+must not truncate an earlier valid archive. A failed candidate may be discarded
+only before the connector boundary, after checking its business-state inventories
+are unchanged and archiving it. After that boundary, repair the current state.
