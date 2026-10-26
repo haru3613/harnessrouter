@@ -25,14 +25,34 @@ def test_private_dispatch_artifact_is_a_verified_named_build_context() -> None:
         "HR_DISPATCH_ARTIFACT_SHA256",
         "HR_SOURCE_GATEWAY_REVISION",
     }
+    assert build["args"]["HR_SOURCE_GATEWAY_REVISION"] == (
+        "${HR_SOURCE_GATEWAY_REVISION:?Set the full source-gateway commit revision}"
+    )
     assert "COPY --from=dispatch_source" in dockerfile
     assert 'tree_hash.update(b"\\0")' in dockerfile
     assert 'tree_hash.update(sha256(path.read_bytes()).digest())' in dockerfile
     assert "private dispatch artifact revision does not match" in dockerfile
     assert "private dispatch artifact tree hash does not match" in dockerfile
+    assert "HR_SOURCE_GATEWAY_REVISION must be a full 40-character hexadecimal commit" in dockerfile
     assert 'org.opencontainers.image.revision="${HR_SOURCE_GATEWAY_REVISION}"' in dockerfile
     assert 'dispatch-source.revision="${HR_DISPATCH_SOURCE_REVISION}"' in dockerfile
     assert "USER 501:10001" in dockerfile
+
+
+def test_compose_project_and_state_volume_ownership_are_explicit() -> None:
+    compose = _compose()
+
+    assert compose["name"] == (
+        "${HR_COMPOSE_PROJECT_NAME:?Set the existing HarnessRouter Compose project}"
+    )
+    assert compose["volumes"] == {
+        "haru-harnessrouter-data": {
+            "name": "${HR_HARNESSROUTER_DATA_VOLUME:?Set the existing HarnessRouter data volume}"
+        },
+        "dispatch-state": {
+            "name": "${HR_DISPATCH_DATA_VOLUME:?Set the migrated dispatch state volume}"
+        },
+    }
 
 
 def test_source_credentials_and_state_do_not_cross_service_boundaries() -> None:

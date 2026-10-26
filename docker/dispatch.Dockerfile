@@ -3,7 +3,7 @@ FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0
 
 ARG HR_DISPATCH_SOURCE_REVISION
 ARG HR_DISPATCH_ARTIFACT_SHA256
-ARG HR_SOURCE_GATEWAY_REVISION=dev
+ARG HR_SOURCE_GATEWAY_REVISION
 
 RUN groupadd --gid 10001 dispatch \
     && useradd --uid 501 --gid 10001 --no-create-home dispatch \
@@ -17,17 +17,19 @@ WORKDIR /app
 COPY --from=dispatch_source --chown=501:10001 . /app/compat
 COPY --chown=501:10001 source_gateway /app/source_gateway
 
-RUN python3 - "$HR_DISPATCH_SOURCE_REVISION" "$HR_DISPATCH_ARTIFACT_SHA256" <<'PY'
+RUN python3 - "$HR_DISPATCH_SOURCE_REVISION" "$HR_DISPATCH_ARTIFACT_SHA256" "$HR_SOURCE_GATEWAY_REVISION" <<'PY'
 from hashlib import sha256
 from pathlib import Path
 import sys
 
 root = Path("/app/compat")
-expected_revision, expected_tree_hash = sys.argv[1:]
+expected_revision, expected_tree_hash, gateway_revision = sys.argv[1:]
 if not expected_revision:
     raise SystemExit("HR_DISPATCH_SOURCE_REVISION is required")
 if not expected_tree_hash:
     raise SystemExit("HR_DISPATCH_ARTIFACT_SHA256 is required")
+if len(gateway_revision) != 40 or any(character not in "0123456789abcdef" for character in gateway_revision):
+    raise SystemExit("HR_SOURCE_GATEWAY_REVISION must be a full 40-character hexadecimal commit")
 
 revision_file = root / "DISPATCH_SOURCE_REVISION"
 actual_revision = revision_file.read_text(encoding="utf-8").strip()

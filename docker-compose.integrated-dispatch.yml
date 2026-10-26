@@ -1,5 +1,7 @@
 # Pair only with docker-compose.haru.yml. The old Dispatch Compose project and
 # its external network are not part of this deployment.
+name: ${HR_COMPOSE_PROJECT_NAME:?Set the existing HarnessRouter Compose project}
+
 services:
   harnessrouter:
     image: ${HR_HARNESSROUTER_IMAGE:-haru-harnessrouter:local}
@@ -23,7 +25,7 @@ services:
       args:
         HR_DISPATCH_SOURCE_REVISION: ${HR_DISPATCH_SOURCE_REVISION:?Set the pinned dispatch source revision}
         HR_DISPATCH_ARTIFACT_SHA256: ${HR_DISPATCH_ARTIFACT_SHA256:?Set the pinned dispatch artifact tree hash}
-        HR_SOURCE_GATEWAY_REVISION: ${HR_SOURCE_GATEWAY_REVISION:-dev}
+        HR_SOURCE_GATEWAY_REVISION: ${HR_SOURCE_GATEWAY_REVISION:?Set the full source-gateway commit revision}
     command: [run]
     user: "501:10001"
     init: true
@@ -100,7 +102,10 @@ services:
       - ingress
 
 volumes:
+  haru-harnessrouter-data:
+    name: ${HR_HARNESSROUTER_DATA_VOLUME:?Set the existing HarnessRouter data volume}
   dispatch-state:
+    name: ${HR_DISPATCH_DATA_VOLUME:?Set the migrated dispatch state volume}
 
 networks:
   ingress:
