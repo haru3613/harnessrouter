@@ -585,11 +585,14 @@ def main(argv: list[str] | None = None) -> int:
         _emit("__hr_result", {"status": "failed", "reason": "Herdr driver job is unreadable", "final": "", "session_id": ""})
         return 0
     turn: Turn | None = None
+    def on_term(_signum, _frame):  # noqa: ANN001
+        raise KeyboardInterrupt
+    # The runner waits for this readiness frame before signalling a cancellation
+    # that raced Popen, so SIGTERM cannot beat handler installation.
+    signal.signal(signal.SIGTERM, on_term)
+    _emit("__hr_ready", {})
     try:
         turn = Turn(raw)
-        def on_term(_signum, _frame):  # noqa: ANN001
-            raise KeyboardInterrupt
-        signal.signal(signal.SIGTERM, on_term)
         return turn.run()
     except KeyboardInterrupt:
         reason = turn.cancel() if turn else "remote_stop_unknown"

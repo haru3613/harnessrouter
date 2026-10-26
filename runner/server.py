@@ -12018,9 +12018,11 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
         return
     rec["pid"] = proc.pid
     rec["proc"] = proc   # live handle so POST /turn/{id}/cancel can kill on demand
-    if rec.get("cancelled"):
-        # A remote driver owns a source-side task. Even when cancellation wins
-        # the spawn race it needs SIGTERM first to cancel that task.
+    if rec.get("cancelled") and str(rec.get("backend") or "") == "herdr":
+        # Do not race the driver's SIGTERM handler installation. Its ready
+        # frame below is when a graceful source cancellation becomes possible.
+        rec["cancel_after_driver_ready"] = True
+    elif rec.get("cancelled"):
         _stop_proc(proc, rec)
     # Hard wall-clock cap — the caller's timeout_seconds (harness config / request override),
     # bounded by the global MAX_TURN_SECONDS ceiling (resource abuse backstop).
@@ -12054,6 +12056,12 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
             try:
                 obj = json.loads(raw)
             except Exception:  # noqa: BLE001
+                continue
+            if obj.get("m") == "__hr_ready":
+                rec["driver_ready"] = True
+                if rec.get("cancel_after_driver_ready") and proc.poll() is None:
+                    rec["cancel_after_driver_ready"] = False
+                    _stop_proc(proc, rec)
                 continue
             for ev in normalize(obj, state):
                 _settle(ev)
@@ -13651,6 +13659,8 @@ def turn(req: TurnReq, identifier: str = "") -> dict:
     spec = BACKENDS.get(backend)
     if not spec:
         raise HTTPException(400, f"unknown backend '{backend}' (one of {sorted(BACKENDS)})")
+    if (req.haru_route is not None or req.haru_route_capability is not None) and backend != "herdr":
+        raise HTTPException(400, "HARU route adoption is only valid for the herdr backend")
     if backend == "herdr":
         try:
             herdr_backend.validate_request(req)

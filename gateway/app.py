@@ -1960,8 +1960,12 @@ async def _haru_route_integration_conn(backend: str, canonical: str) -> dict | N
     pid = (models.get(canonical) or models.get(canonical.lower())) if canonical else ""
     if canonical and not pid:
         return None
-    conn = {"name": f"integration:{name}", "backend": backend, "provider": "local_subscription",
-            **{k: v for k, v in config.items() if v not in (None, "")}}
+    # Do not spread arbitrary integration config here: a poisoned saved
+    # `backend` or `provider` must not override this adoption pin.
+    conn = {"name": f"integration:{name}", "backend": backend, "provider": "local_subscription"}
+    for field in ("base_url", "api_key"):
+        if config.get(field) not in (None, ""):
+            conn[field] = config[field]
     if pid:
         conn["model"] = pid
         conn["_model_resolved"] = True

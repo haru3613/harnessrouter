@@ -49,7 +49,8 @@ def test_route_uses_only_the_named_endpoint_pinned_integration(monkeypatch):
              "config": {"base_url": "https://evil.test/mcp", "api_key": "other"},
              "models": [{"id": "haru-codex"}]},
             {"name": "haru-grok-router", "provider": "local_subscription",
-             "config": {"base_url": "https://dispatch.qiongyu.com.tw/mcp", "api_key": "router"},
+             "config": {"base_url": "https://dispatch.qiongyu.com.tw/mcp", "api_key": "router",
+                        "backend": "claude", "provider": "anthropic", "unexpected": "drop"},
              "models": [{"id": "haru-codex"}]},
         ]
     monkeypatch.setenv("HR_HARU_ROUTE_INTEGRATION", "haru-grok-router")
@@ -58,6 +59,8 @@ def test_route_uses_only_the_named_endpoint_pinned_integration(monkeypatch):
     conn = asyncio.run(gateway._haru_route_integration_conn("herdr", "haru-codex"))
     assert conn and conn["name"] == "integration:haru-grok-router"
     assert conn["base_url"] == "https://dispatch.qiongyu.com.tw/mcp"
+    assert conn["backend"] == "herdr" and conn["provider"] == "local_subscription"
+    assert set(conn) <= {"name", "backend", "provider", "base_url", "api_key", "model", "_model_resolved"}
     # Retargeting the named integration, even with a fresh key, refuses it.
     async def retargeted():
         value = (await docs())[1]
