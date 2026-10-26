@@ -14,8 +14,6 @@ from typing import Any
 
 _DATABASES = ("jobs.sqlite3", "bridge.sqlite3", "oauth.sqlite3")
 _HEX = frozenset("0123456789abcdef")
-_WAL_MAGIC_LITTLE_CHECKSUM = 0x377F0682
-_WAL_MAGIC_BIG_CHECKSUM = 0x377F0683
 
 
 class StateValidationError(RuntimeError):
@@ -133,101 +131,17 @@ def artifact_tree_sha256(root: str | os.PathLike[str]) -> str:
     return tree.hexdigest()
 
 
-def _wal_checksum(data: bytes, state: tuple[int, int], byteorder: str) -> tuple[int, int]:
-    if len(data) % 8:
-        raise StateValidationError("database WAL validation failed")
-    first, second = state
-    for offset in range(0, len(data), 8):
-        word_one = int.from_bytes(data[offset:offset + 4], byteorder)
-        word_two = int.from_bytes(data[offset + 4:offset + 8], byteorder)
-        first = (first + word_one + second) & 0xFFFFFFFF
-        second = (second + word_two + first) & 0xFFFFFFFF
-    return first, second
-
-
-def _validate_wal_once(path: Path) -> None:
-    try:
-        with path.open("rb") as wal:
-            size = os.fstat(wal.fileno()).st_size
-            if size == 0:
-                return
-            header = wal.read(32)
-            if len(header) != 32:
-                raise StateValidationError("database WAL validation failed")
-            magic = int.from_bytes(header[0:4], "big")
-            if magic == _WAL_MAGIC_LITTLE_CHECKSUM:
-                byteorder = "little"
-            elif magic == _WAL_MAGIC_BIG_CHECKSUM:
-                byteorder = "big"
-            else:
-                raise StateValidationError("database WAL validation failed")
-            if int.from_bytes(header[4:8], "big") != 3_007_000:
-                raise StateValidationError("database WAL validation failed")
-            page_size = int.from_bytes(header[8:12], "big")
-            if page_size == 1:
-                page_size = 65_536
-            if page_size < 512 or page_size > 65_536 or page_size & (page_size - 1):
-                raise StateValidationError("database WAL validation failed")
-            frame_size = 24 + page_size
-            if size < 32 or (size - 32) % frame_size:
-                raise StateValidationError("database WAL validation failed")
-            checksum = _wal_checksum(header[:24], (0, 0), byteorder)
-            stored_header_checksum = (
-                int.from_bytes(header[24:28], "big"),
-                int.from_bytes(header[28:32], "big"),
-            )
-            if checksum != stored_header_checksum:
-                raise StateValidationError("database WAL validation failed")
-            salt = header[16:24]
-            for _ in range((size - 32) // frame_size):
-                frame_header = wal.read(24)
-                page = wal.read(page_size)
-                if len(frame_header) != 24 or len(page) != page_size:
-                    raise StateValidationError("database WAL validation failed")
-                if int.from_bytes(frame_header[:4], "big") == 0 or frame_header[8:16] != salt:
-                    raise StateValidationError("database WAL validation failed")
-                checksum = _wal_checksum(frame_header[:8] + page, checksum, byteorder)
-                stored_frame_checksum = (
-                    int.from_bytes(frame_header[16:20], "big"),
-                    int.from_bytes(frame_header[20:24], "big"),
-                )
-                if checksum != stored_frame_checksum:
-                    raise StateValidationError("database WAL validation failed")
-    except StateValidationError:
-        raise
-    except OSError as exc:
-        raise StateValidationError("database WAL validation failed") from exc
-
-
-def _validate_wal(database: Path) -> None:
-    wal = Path(str(database) + "-wal")
-    shm = Path(str(database) + "-shm")
-    if not wal.exists() and not wal.is_symlink():
-        if shm.exists() or shm.is_symlink():
-            raise StateValidationError("database WAL validation failed")
-        return
-    _regular_file(wal, "database WAL")
-    if shm.exists() or shm.is_symlink():
-        _regular_file(shm, "database SHM")
-    # A writer can checkpoint and replace the WAL between lstat and read. A
-    # small bounded retry avoids turning that normal transition into a false
-    # health failure while still rejecting stable corrupt state.
-    failure: StateValidationError | None = None
-    for _ in range(3):
-        try:
-            _validate_wal_once(wal)
-            return
-        except StateValidationError as exc:
-            failure = exc
-            if not wal.exists() and not shm.exists():
-                return
-    assert failure is not None
-    raise failure
+def _validate_sqlite_sidecars(database: Path) -> None:
+    """Reject redirected/special sidecars; SQLite owns their live format."""
+    for suffix, label in (("-wal", "database WAL"), ("-shm", "database SHM")):
+        sidecar = Path(str(database) + suffix)
+        if sidecar.exists() or sidecar.is_symlink():
+            _regular_file(sidecar, label)
 
 
 def _open_database(path: Path) -> sqlite3.Connection:
     _regular_file(path, "state database")
-    _validate_wal(path)
+    _validate_sqlite_sidecars(path)
     try:
         # mode=ro prevents schema/data writes while still letting SQLite recover
         # committed rows from an existing WAL. It may create ephemeral SHM

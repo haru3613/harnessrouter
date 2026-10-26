@@ -1,7 +1,6 @@
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import sqlite3
 
 import pytest
@@ -151,27 +150,31 @@ def test_valid_state_reads_committed_wal_rows_before_and_after_checkpoint(tmp_pa
     assert report["published_event_count"] == 2
 
 
-def test_corrupt_wal_is_rejected_instead_of_silently_reading_stale_main_db(tmp_path):
+def test_reused_wal_with_stale_tail_after_passive_checkpoint_is_valid(tmp_path):
     compat = build_compat(tmp_path)
     state = build_state(tmp_path, compat)
     writer = sqlite3.connect(state / "jobs.sqlite3")
     try:
         assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
         writer.execute("PRAGMA wal_autocheckpoint=0")
-        writer.execute("INSERT INTO jobs VALUES(?)", ("committed-only-in-wal",))
+        writer.executemany(
+            "INSERT INTO jobs VALUES(?)",
+            [(f"large-wal-{index}",) for index in range(500)],
+        )
         writer.commit()
-        recovered = tmp_path / "recovered"
-        shutil.copytree(state, recovered)
+        large_size = (state / "jobs.sqlite3-wal").stat().st_size
+        checkpoint = writer.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        assert checkpoint[0] == 0
+        writer.execute("INSERT INTO jobs VALUES(?)", ("after-passive-checkpoint",))
+        writer.commit()
+        # SQLite can reuse the WAL from frame one without truncating its stale
+        # physical tail. The live snapshot is defined by SQLite, not file size.
+        assert (state / "jobs.sqlite3-wal").stat().st_size == large_size
+
+        report = validate_state(state, compat_root=compat)
+        assert report["job_count"] == 503
     finally:
         writer.close()
-
-    wal = recovered / "jobs.sqlite3-wal"
-    data = bytearray(wal.read_bytes())
-    data[:32] = b"X" * 32
-    wal.write_bytes(data)
-
-    with pytest.raises(StateValidationError, match="database WAL validation failed"):
-        validate_state(recovered, compat_root=compat)
 
 
 @pytest.mark.parametrize("missing", ["jobs.sqlite3", "bridge.sqlite3", "oauth.sqlite3"])
@@ -269,6 +272,29 @@ def test_symlinked_database_is_rejected(tmp_path):
 
     with pytest.raises(StateValidationError, match="invalid state database"):
         validate_state(state)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "message"),
+    [("-wal", "invalid database WAL"), ("-shm", "invalid database SHM")],
+)
+def test_symlinked_sqlite_sidecar_is_rejected(tmp_path, suffix, message):
+    state = build_state(tmp_path)
+    target = tmp_path / "sidecar-target"
+    target.write_bytes(b"")
+    Path(str(state / "jobs.sqlite3") + suffix).symlink_to(target)
+
+    with pytest.raises(StateValidationError, match=message):
+        validate_state(state)
+
+
+def test_transient_shm_without_wal_is_not_rejected(tmp_path):
+    state = build_state(tmp_path)
+    Path(str(state / "jobs.sqlite3") + "-shm").write_bytes(b"")
+
+    report = validate_state(state)
+
+    assert report["job_count"] == 2
 
 
 def test_unmanifested_database_is_rejected(tmp_path):

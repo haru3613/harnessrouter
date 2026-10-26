@@ -2,7 +2,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import sqlite3
 import stat
 
@@ -145,7 +144,6 @@ def test_non_quiesced_source_is_rejected_before_destination_creation(tmp_path):
 
     assert not destination.exists()
 
-
 def test_nonempty_and_symlink_destinations_are_refused(tmp_path):
     compat = build_compat(tmp_path)
     source = build_state(tmp_path, compat)
@@ -226,27 +224,12 @@ def test_wrong_revision_and_artifact_drift_fail_closed(tmp_path):
     assert not destination.exists()
 
 
-def test_corrupt_source_wal_is_not_ignored_by_backup(tmp_path):
+def test_migration_accepts_transient_shm_without_wal(tmp_path):
     compat = build_compat(tmp_path)
-    original = build_state(tmp_path, compat)
-    writer = sqlite3.connect(original / "jobs.sqlite3")
-    try:
-        assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
-        writer.execute("PRAGMA wal_autocheckpoint=0")
-        writer.execute("INSERT INTO jobs VALUES(?)", ("committed-only-in-wal",))
-        writer.commit()
-        source = tmp_path / "corrupt-source"
-        shutil.copytree(original, source)
-    finally:
-        writer.close()
-
-    wal = source / "jobs.sqlite3-wal"
-    data = bytearray(wal.read_bytes())
-    data[24:32] = b"X" * 8
-    wal.write_bytes(data)
+    source = build_state(tmp_path, compat)
+    Path(str(source / "jobs.sqlite3") + "-shm").write_bytes(b"")
     destination = tmp_path / "migrated"
 
-    with pytest.raises(MigrationError, match="unreadable source database"):
-        _clone(source, destination, compat)
+    _clone(source, destination, compat)
 
-    assert not destination.exists()
+    assert (destination / ".migration-complete.json").is_file()

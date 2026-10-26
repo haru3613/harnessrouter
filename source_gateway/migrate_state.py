@@ -13,7 +13,12 @@ import stat
 import tempfile
 from typing import Any
 
-from .validation import StateValidationError, _validate_wal, artifact_tree_sha256, validate_state
+from .validation import (
+    StateValidationError,
+    _validate_sqlite_sidecars,
+    artifact_tree_sha256,
+    validate_state,
+)
 
 
 _DATABASES = ("jobs.sqlite3", "bridge.sqlite3", "oauth.sqlite3")
@@ -99,7 +104,7 @@ def _digest_set(values: list[bytes]) -> str:
 def _connect_readonly(path: Path) -> sqlite3.Connection:
     _require_regular(path, "source database")
     try:
-        _validate_wal(path)
+        _validate_sqlite_sidecars(path)
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only=ON")
