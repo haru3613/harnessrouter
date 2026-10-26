@@ -141,6 +141,11 @@ def test_api_cancel_after_popen_defers_until_herdr_ready(monkeypatch,tmp_path):
     rec={'status':'running','events':[],'result':'','done':False,'started':time.time(),'backend':'herdr'}
     monkeypatch.setitem(rs._turns,'herdr-api-race',rec)
     monkeypatch.setattr(rs,'_REMOTE_STOP_GRACE_S',.2)
+    original_stop=rs._stop_proc; stops=[]
+    def counted_stop(proc, record):
+        stops.append(proc.pid)
+        return original_stop(proc, record)
+    monkeypatch.setattr(rs,'_stop_proc',counted_stop)
     child=("import json,signal,time; "
            "signal.signal(signal.SIGTERM,lambda *_:exit(0)); time.sleep(.25); "
            "print(json.dumps({'m':'__hr_ready','p':{}}),flush=True); time.sleep(5)")
@@ -150,10 +155,17 @@ def test_api_cancel_after_popen_defers_until_herdr_ready(monkeypatch,tmp_path):
         if rec.get('proc') is not None: break
         time.sleep(.01)
     assert rec.get('proc') is not None
+    proc=rec['proc']
     assert rs.cancel_turn('herdr-api-race')['cancelled'] is True
+    assert rs.cancel_turn('herdr-api-race')['cancelled'] is True
+    rs._kill_capped(proc,rec)
     for _ in range(100):
         if rec.get('cancel_after_driver_ready'): break
         time.sleep(.01)
     assert rec.get('cancel_after_driver_ready') is True
     thread.join(3)
     assert not thread.is_alive() and rec.get('driver_ready') is True
+    # Repeated API cancellation and the watchdog before/after readiness send
+    # exactly one SIGTERM to the initialized driver.
+    rs._kill_capped(proc,rec)
+    assert len(stops) == 1 and rec.get('stop_signal_sent') is True

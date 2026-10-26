@@ -11936,9 +11936,12 @@ def _request_stop_proc(proc: subprocess.Popen, rec: dict) -> bool:
     """
     if str(rec.get("backend") or "") == "herdr":
         with _turns_lock:
+            if rec.get("stop_signal_sent"):
+                return False
             if not rec.get("driver_ready"):
                 rec["cancel_after_driver_ready"] = True
                 return False
+            rec["stop_signal_sent"] = True
     _stop_proc(proc, rec)
     return True
 
@@ -12073,7 +12076,10 @@ def _run_turn_bg(turn_id: str, cmd: list[str], env: dict, cwd: str, normalize, m
                 with _turns_lock:
                     rec["driver_ready"] = True
                     pending = bool(rec.pop("cancel_after_driver_ready", False))
-                if pending and proc.poll() is None:
+                    send_stop = pending and not rec.get("stop_signal_sent")
+                    if send_stop:
+                        rec["stop_signal_sent"] = True
+                if send_stop and proc.poll() is None:
                     _stop_proc(proc, rec)
                 continue
             for ev in normalize(obj, state):
