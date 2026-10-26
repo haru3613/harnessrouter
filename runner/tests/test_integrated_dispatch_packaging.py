@@ -23,12 +23,15 @@ def test_private_dispatch_artifact_is_a_verified_named_build_context() -> None:
     assert set(build["args"]) == {
         "HR_DISPATCH_SOURCE_REVISION",
         "HR_DISPATCH_ARTIFACT_SHA256",
+        "HR_SOURCE_GATEWAY_REVISION",
     }
     assert "COPY --from=dispatch_source" in dockerfile
     assert 'tree_hash.update(b"\\0")' in dockerfile
     assert 'tree_hash.update(sha256(path.read_bytes()).digest())' in dockerfile
     assert "private dispatch artifact revision does not match" in dockerfile
     assert "private dispatch artifact tree hash does not match" in dockerfile
+    assert 'org.opencontainers.image.revision="${HR_SOURCE_GATEWAY_REVISION}"' in dockerfile
+    assert 'dispatch-source.revision="${HR_DISPATCH_SOURCE_REVISION}"' in dockerfile
     assert "USER 501:10001" in dockerfile
 
 

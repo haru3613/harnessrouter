@@ -3,6 +3,7 @@ FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0
 
 ARG HR_DISPATCH_SOURCE_REVISION
 ARG HR_DISPATCH_ARTIFACT_SHA256
+ARG HR_SOURCE_GATEWAY_REVISION=dev
 
 RUN groupadd --gid 10001 dispatch \
     && useradd --uid 501 --gid 10001 --no-create-home dispatch \
@@ -48,7 +49,8 @@ if tree_hash.hexdigest() != expected_tree_hash.lower():
     raise SystemExit("private dispatch artifact tree hash does not match the pinned hash")
 PY
 
-LABEL org.opencontainers.image.revision="${HR_DISPATCH_SOURCE_REVISION}" \
+LABEL org.opencontainers.image.revision="${HR_SOURCE_GATEWAY_REVISION}" \
+      ai.harnessrouter.dispatch-source.revision="${HR_DISPATCH_SOURCE_REVISION}" \
       ai.harnessrouter.dispatch-source.sha256="${HR_DISPATCH_ARTIFACT_SHA256}"
 
 ENV PYTHONUNBUFFERED=1 \

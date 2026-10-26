@@ -23,6 +23,7 @@ services:
       args:
         HR_DISPATCH_SOURCE_REVISION: ${HR_DISPATCH_SOURCE_REVISION:?Set the pinned dispatch source revision}
         HR_DISPATCH_ARTIFACT_SHA256: ${HR_DISPATCH_ARTIFACT_SHA256:?Set the pinned dispatch artifact tree hash}
+        HR_SOURCE_GATEWAY_REVISION: ${HR_SOURCE_GATEWAY_REVISION:-dev}
     command: [run]
     user: "501:10001"
     init: true
