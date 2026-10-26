@@ -43,7 +43,8 @@ def main():
                       POOL_MGMT_ENDPOINT=f'http://127.0.0.1:{rp}',HR_SANDBOX_TRUST='owner',
                       HARNESS_INTERNAL_KEY=internal,HR_SESSION_UIDS='0',HR_SANDBOX_PER_SESSION='0',
                       HR_BROKER_IMAGES='0',HR_BUILTIN_SKILLS_DIR=str(root/'no-skills'),
-                      ROUTE_TEST_OWNER=owner_token,ROUTE_TEST_WORKER=worker_token,ROUTE_TEST_ROUTER=router_token)
+                      ROUTE_TEST_OWNER=owner_token,ROUTE_TEST_WORKER=worker_token,ROUTE_TEST_ROUTER=router_token,
+                      HR_HARU_ROUTE_INTEGRATION='haru-grok-router',HR_HARU_ROUTE_MCP_ENDPOINT=mcp)
     sys.path[:0]=[str(repo/'gateway'),str(repo/'runner'),str(Path(args.haru_source).resolve())]
     import uvicorn
     import app as gw
@@ -77,7 +78,7 @@ def main():
         ws=http(gateway,'POST','/v1/hr/workspaces',{'name':'Grok route fixture'},admin)
         wsid=ws.get('id') or ws.get('workspace',{}).get('id');assert wsid, list(ws)
         scoped={**admin,'x-harness-workspace':wsid}
-        http(gateway,'PUT','/v1/admin/integrations',{'integrations':[{'name':'route-fixture','provider':'local_subscription',
+        http(gateway,'PUT','/v1/admin/integrations',{'integrations':[{'name':'haru-grok-router','provider':'local_subscription',
              'config':{'base_url':mcp,'api_key':router_token},'models':['haru-auto','haru-codex','haru-claude']}]},admin)
         h=http(gateway,'POST','/v1/harnesses',{'name':'Grok fixture','base':'herdr','default_model':'haru-codex',
              'env':{'HARU_WORKSPACE':'fixture'},'system_prompt':'Original Grok task authority remains on HARU.','timeout_seconds':120},scoped)
@@ -87,6 +88,70 @@ def main():
         os.environ.update(HR_HARU_ROUTE_API_KEY_SHA256=hashlib.sha256(key.encode()).hexdigest(),
                           HR_HARU_ROUTE_WORKSPACE=wsid,HR_HARU_ROUTE_HARNESSES=hid,ROUTE_TEST_API_KEY=key)
         owner=MCPClient(mcp,owner_token);worker=MCPClient(mcp,worker_token)
+        api_headers={'Authorization':'Bearer '+key}
+
+        def stage(request_id, text):
+            task=owner.call('submit_session_task',{'task':text,'request_id':request_id,'workspace':'fixture',
+                'mode':'analysis','requested_provider':'codex','complexity_hint':'standard',
+                'required_capabilities':['read'],'result_contract':'response_only'})['task']
+            assert task['status']=='waiting_route',task
+            return task
+
+        def pump(task_id):
+            outcome=pump_once(root/'broker',config);assert outcome['submitted']==1,outcome
+            task=owner.call('get_task',{'task_id':task_id})['task'];rid=task['route']['response_id'];assert rid,task
+            return rid
+
+        def until(task_id, predicate, label, reconcile=False):
+            for _ in range(100):
+                if reconcile:
+                    # Production's runtime pump does this periodically. The
+                    # fixture drives the same idempotent retry explicitly.
+                    pump_once(root/'broker',config)
+                task=owner.call('get_task',{'task_id':task_id})['task']
+                if predicate(task): return task
+                time.sleep(.05)
+            raise AssertionError(label+': '+json.dumps(task))
+
+        def cancel_http(response_id):
+            cancelled=http(gateway,'POST','/v1/responses/'+response_id+'/cancel',headers=api_headers)
+            assert cancelled['status']=='cancelled',cancelled
+            return cancelled
+
+        # Cancellation before a worker can claim must terminally cancel exactly
+        # the staged source task; pump must not submit a fallback task.
+        before=stage('route-cancel-before','cancel before activation')
+        before_rid=pump(before['id']);cancel_http(before_rid)
+        before_final=until(before['id'],lambda t:t['execution_state']=='cancelled','pre-activation cancel',reconcile=True)
+        assert before_final['cancel_requested'] is True and worker.call('claim_session_task',{})['task'] is None
+
+        # Once adoption has activated but no worker has claimed it, the same
+        # HTTP cancel reaches cancel_route_task and remains a source terminal.
+        queued=stage('route-cancel-queued','cancel after activation while queued')
+        queued_rid=pump(queued['id'])
+        until(queued['id'],lambda t:t['execution_state']=='queued' and t['status']=='queued'
+              and t.get('route',{}).get('state')=='activated','activation to queue')
+        cancel_http(queued_rid)
+        queued_final=until(queued['id'],lambda t:t['execution_state']=='cancelled','queued cancel',reconcile=True)
+        assert queued_final['cancel_requested'] is True and worker.call('claim_session_task',{})['task'] is None
+
+        # A fake host worker is deliberately active here. Cancellation is only
+        # a request until that worker reports a cancelled terminal result.
+        active=stage('route-cancel-active','cancel while fake host is active')
+        active_rid=pump(active['id'])
+        active_claim=until(active['id'],lambda t:t['execution_state']=='queued' and t['status']=='queued'
+                           and t.get('route',{}).get('state')=='activated','active route queue')
+        active_claim=worker.call('claim_session_task',{})['task'];assert active_claim and active_claim['id']==active['id']
+        active_lease=active_claim['lease_id']
+        worker.call('report_session_event',{'task_id':active['id'],'lease_id':active_lease,'event_id':'started','kind':'started','body':{'provider':'codex'}})
+        cancel_http(active_rid)
+        active_requested=until(active['id'],lambda t:t['execution_state']=='cancel_requested','active cancel request',reconcile=True)
+        assert active_requested['cancel_requested'] is True
+        worker.call('report_session_event',{'task_id':active['id'],'lease_id':active_lease,'event_id':'cancelled','kind':'result',
+            'body':{'status':'cancelled','result':'fixture host observed cancellation','evidence':['fake host only']}})
+        active_final=until(active['id'],lambda t:t['execution_state']=='cancelled','active cancel terminal',reconcile=True)
+        assert active_final['cancel_requested'] is True
+
         submitted=owner.call('submit_session_task',{'task':'Preserve this original request and wait for a fixture answer.',
              'request_id':'route-proof-1','workspace':'fixture','mode':'analysis','requested_provider':'codex',
              'complexity_hint':'standard','required_capabilities':['read'],'result_contract':'response_only'})['task']
@@ -109,7 +174,6 @@ def main():
         report('started','started',{'provider':'codex'})
         question=report('question','question',{'question':'Confirm this fixture can finish.','evidence':['fixture only']})
         time.sleep(1.5)
-        api_headers={'Authorization':'Bearer '+key}
         pending=http(gateway,'GET','/v1/responses/'+rid,headers=api_headers)
         assert pending['status'] in {'queued','in_progress','running'},pending['status']
         adapter=SessionDispatchAPI(root/'broker','fixture-delivery',config,trusted_delivery_adapter=True)
@@ -128,7 +192,7 @@ def main():
         assert response['status']=='completed',response
         assert 'ROUTE_INTEGRATION_OK' in json.dumps(response)
         final=owner.call('get_task',{'task_id':tid})['task'];assert final['return_state']=='handled'
-        assert len(owner.call('list_tasks',{})['tasks'])==1
+        assert len(owner.call('list_tasks',{})['tasks'])==4
         assert owner.call('submit_session_task',{'task':'Preserve this original request and wait for a fixture answer.',
              'request_id':'route-proof-1','workspace':'fixture','mode':'analysis','requested_provider':'codex',
              'complexity_hint':'standard','required_capabilities':['read'],'result_contract':'response_only'})['task']['id']==tid
@@ -144,17 +208,20 @@ def main():
         assert rejected,'revoked key reused trusted internal identity'
         from haru_dispatch.session_api import RouteStore
         store=RouteStore(root/'broker',config)
-        with store.api._connect() as con: activation=store.api._route_capability(store.api._route(con,tid))
+        with store.api._connect() as con:
+            private_material=[router_token]
+            for task_id in (before['id'],queued['id'],active['id'],tid):
+                private_material.append(store.api._route_capability(store.api._route(con,task_id)))
         for tree in [root/'workspaces',root/'hr-data'/'blobs']:
             if tree.exists():
                 for file in tree.rglob('*'):
                     if file.is_file() and not file.is_symlink() and file.stat().st_size<4*1024*1024:
                         raw=file.read_bytes()
-                        assert activation.encode() not in raw and router_token.encode() not in raw, 'private route material leaked to artifact'
+                        assert all(secret.encode() not in raw for secret in private_material), 'private route material leaked to artifact'
         output=json.dumps(response)
         for secret in [owner_token,worker_token,router_token,key,qc['reply_capability'],rc['ack_capability']]:assert secret not in output
         receipt={'passed':True,'root':str(root),'task_id':tid,'response_id':rid,'workspace':wsid,
-                 'same_task_count':1,'waiting_input_preserved':True,'source_ack':'controlled-fixture',
+                 'same_task_count':4,'waiting_input_preserved':True,'source_ack':'controlled-fixture',
                  'real_model_execution':False,'revoked_key_rejected':True,'private_material_not_in_artifacts':True,'response_status':response['status']}
         (root/'receipt.json').write_text(json.dumps(receipt,indent=2));print(json.dumps(receipt),flush=True)
     finally:
