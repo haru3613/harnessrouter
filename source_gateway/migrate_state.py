@@ -381,7 +381,10 @@ def clone_broker_state(
     source_path = Path(source)
     destination_path = Path(destination)
     source_status = _require_directory(source_path, "source state")
-    if destination_path.absolute().is_relative_to(source_path.absolute()):
+    # Resolve parent aliases only after rejecting a symlink at the source root.
+    # Otherwise an absent lexical sibling can actually stage inside the source
+    # through a symlinked parent and be encountered by the recursive copy.
+    if destination_path.resolve(strict=False).is_relative_to(source_path.resolve(strict=True)):
         raise MigrationError("invalid destination")
     existed, destination_identity = _prepare_destination(destination_path)
     try:

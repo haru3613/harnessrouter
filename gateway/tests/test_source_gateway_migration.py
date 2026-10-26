@@ -165,6 +165,11 @@ def test_nonempty_and_symlink_destinations_are_refused(tmp_path):
         _clone(source, linked, compat)
     assert not any(real.iterdir())
 
+    source_alias = tmp_path / "source-alias"
+    source_alias.symlink_to(source, target_is_directory=True)
+    with pytest.raises(MigrationError, match="invalid destination"):
+        _clone(source, source_alias / "nested-destination", compat)
+
 
 def test_source_database_symlink_and_extra_database_are_refused(tmp_path):
     compat = build_compat(tmp_path)
