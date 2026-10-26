@@ -18,9 +18,21 @@ def _clone(source: Path, destination: Path, compat: Path, *, quiesced=True):
     return clone_broker_state(source, destination, compat, REVISION, quiesced)
 
 
+def build_migration_state(root: Path, compat: Path) -> Path:
+    state = build_state(root, compat)
+    connection = sqlite3.connect(state / "bridge.sqlite3")
+    connection.execute(
+        "CREATE TABLE delivery_attempts("
+        "id INTEGER PRIMARY KEY, in_flight INTEGER NOT NULL DEFAULT 0)"
+    )
+    connection.commit()
+    connection.close()
+    return state
+
+
 def test_clone_copies_committed_wal_state_keys_handles_and_extra_files(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     config = source / "config.json"
     config.write_text('{"safe":"configuration"}\n')
     config.chmod(0o640)
@@ -64,7 +76,7 @@ def test_clone_copies_committed_wal_state_keys_handles_and_extra_files(tmp_path)
     assert validation["job_count"] == 3
     assert validation["client_count"] == 3
     assert validation["published_event_count"] == 2
-    assert report["databases"]["jobs.sqlite3"]["jobs"]["rows"] == 3
+    assert report["databases"]["jobs.sqlite3"]["tables"]["jobs"]["rows"] == 3
 
     connection = sqlite3.connect(destination / "jobs.sqlite3")
     try:
@@ -99,7 +111,7 @@ def test_clone_copies_committed_wal_state_keys_handles_and_extra_files(tmp_path)
 
 def test_clone_can_atomically_replace_an_existing_empty_destination(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     destination = tmp_path / "migrated"
     destination.mkdir()
 
@@ -109,10 +121,32 @@ def test_clone_can_atomically_replace_an_existing_empty_destination(tmp_path):
     validate_state(destination, compat_root=compat)
 
 
+def test_complete_staged_tree_is_flushed_before_promotion(tmp_path, monkeypatch):
+    compat = build_compat(tmp_path)
+    source = build_migration_state(tmp_path, compat)
+    destination = tmp_path / "migrated"
+    original_durable_tree = migration.durable_tree
+    flushed = []
+
+    def observe_durable_tree(staging):
+        assert not destination.exists()
+        assert (staging / "jobs.sqlite3").is_file()
+        assert (staging / ".migration-report.json").is_file()
+        assert (staging / ".migration-complete.json").is_file()
+        flushed.append(staging)
+        original_durable_tree(staging)
+
+    monkeypatch.setattr(migration, "durable_tree", observe_durable_tree)
+
+    _clone(source, destination, compat)
+
+    assert len(flushed) == 1
+
+
 @pytest.mark.parametrize("failure", ["missing", "corrupt", "crosslink"])
 def test_invalid_source_fails_without_publishing_destination(tmp_path, failure):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     if failure == "missing":
         (source / "bridge.sqlite3").unlink()
     elif failure == "corrupt":
@@ -136,7 +170,7 @@ def test_invalid_source_fails_without_publishing_destination(tmp_path, failure):
 
 def test_non_quiesced_source_is_rejected_before_destination_creation(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     destination = tmp_path / "migrated"
 
     with pytest.raises(MigrationError, match="quiesced"):
@@ -146,7 +180,7 @@ def test_non_quiesced_source_is_rejected_before_destination_creation(tmp_path):
 
 def test_nonempty_and_symlink_destinations_are_refused(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     nonempty = tmp_path / "nonempty"
     nonempty.mkdir()
     sentinel = nonempty / "keep"
@@ -171,7 +205,7 @@ def test_nonempty_and_symlink_destinations_are_refused(tmp_path):
 
 def test_source_database_symlink_and_extra_database_are_refused(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     real_jobs = source / "jobs.real"
     (source / "jobs.sqlite3").rename(real_jobs)
     (source / "jobs.sqlite3").symlink_to(real_jobs)
@@ -187,7 +221,7 @@ def test_source_database_symlink_and_extra_database_are_refused(tmp_path):
 
 def test_concurrent_database_mutation_is_detected_and_not_promoted(tmp_path, monkeypatch):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     destination = tmp_path / "migrated"
     original_backup = migration._backup_database
     mutated = False
@@ -210,9 +244,84 @@ def test_concurrent_database_mutation_is_detected_and_not_promoted(tmp_path, mon
     assert not destination.exists()
 
 
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "CREATE INDEX jobs_added_during_backup ON jobs(id)",
+        "CREATE TRIGGER jobs_added_during_backup AFTER INSERT ON jobs BEGIN SELECT 1; END",
+    ],
+)
+def test_concurrent_schema_mutation_is_detected_and_not_promoted(tmp_path, monkeypatch, ddl):
+    compat = build_compat(tmp_path)
+    source = build_migration_state(tmp_path, compat)
+    destination = tmp_path / "migrated"
+    original_backup = migration._backup_database
+    mutated = False
+
+    def backup_then_mutate(source_database, destination_database):
+        nonlocal mutated
+        original_backup(source_database, destination_database)
+        if not mutated:
+            mutated = True
+            connection = sqlite3.connect(source / "jobs.sqlite3")
+            connection.execute(ddl)
+            connection.commit()
+            connection.close()
+
+    monkeypatch.setattr(migration, "_backup_database", backup_then_mutate)
+
+    with pytest.raises(MigrationError, match="changed during migration"):
+        _clone(source, destination, compat)
+
+    assert not destination.exists()
+
+
+def test_inflight_delivery_attempt_blocks_migration(tmp_path):
+    compat = build_compat(tmp_path)
+    source = build_migration_state(tmp_path, compat)
+    connection = sqlite3.connect(source / "bridge.sqlite3")
+    connection.execute("INSERT INTO delivery_attempts(in_flight) VALUES(1)")
+    connection.commit()
+    connection.close()
+    destination = tmp_path / "migrated"
+
+    with pytest.raises(MigrationError, match="still in flight"):
+        _clone(source, destination, compat)
+
+    assert not destination.exists()
+
+
+def test_inflight_delivery_attempt_appearing_before_promotion_is_detected(
+    tmp_path, monkeypatch,
+):
+    compat = build_compat(tmp_path)
+    source = build_migration_state(tmp_path, compat)
+    destination = tmp_path / "migrated"
+    original_inventory = migration._database_inventory
+    inventory_calls = 0
+
+    def inventory_then_activate(database):
+        nonlocal inventory_calls
+        result = original_inventory(database)
+        inventory_calls += 1
+        if inventory_calls == 9:
+            connection = sqlite3.connect(source / "bridge.sqlite3")
+            connection.execute("INSERT INTO delivery_attempts(in_flight) VALUES(1)")
+            connection.commit()
+            connection.close()
+        return result
+
+    monkeypatch.setattr(migration, "_database_inventory", inventory_then_activate)
+
+    with pytest.raises(MigrationError, match="still in flight"):
+        _clone(source, destination, compat)
+
+    assert not destination.exists()
+
+
 def test_wrong_revision_and_artifact_drift_fail_closed(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     migration._PINNED_ARTIFACT_TREE_SHA256 = artifact_tree_sha256(compat)
     with pytest.raises(MigrationError, match="source revision mismatch"):
         clone_broker_state(source, tmp_path / "wrong-revision", compat, "a" * 40, True)
@@ -226,7 +335,7 @@ def test_wrong_revision_and_artifact_drift_fail_closed(tmp_path):
 
 def test_migration_accepts_transient_shm_without_wal(tmp_path):
     compat = build_compat(tmp_path)
-    source = build_state(tmp_path, compat)
+    source = build_migration_state(tmp_path, compat)
     Path(str(source / "jobs.sqlite3") + "-shm").write_bytes(b"")
     destination = tmp_path / "migrated"
 

@@ -13,6 +13,7 @@ import stat
 import tempfile
 from typing import Any
 
+from .filesystem import durable_tree, sync_directory
 from .validation import (
     StateValidationError,
     _validate_sqlite_sidecars,
@@ -128,10 +129,15 @@ def _database_inventory(path: Path) -> dict[str, dict[str, Any]]:
     connection = _connect_readonly(path)
     try:
         _check_database(connection)
+        schema_objects = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+            "WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name, tbl_name"
+        ).fetchall()
+        schema_hashes = [_row_digest(tuple(schema_object)) for schema_object in schema_objects]
         tables = connection.execute(
             "SELECT name, sql FROM sqlite_schema WHERE type='table' ORDER BY name"
         ).fetchall()
-        inventory: dict[str, dict[str, Any]] = {}
+        table_inventory: dict[str, dict[str, Any]] = {}
         for table in tables:
             name = table["name"]
             if not isinstance(name, str):
@@ -157,14 +163,20 @@ def _database_inventory(path: Path) -> dict[str, dict[str, Any]]:
                     pk_hashes.append(_row_digest(tuple(row[index] for index in pk_indices)))
                 count += 1
             schema = table["sql"] if isinstance(table["sql"], str) else ""
-            inventory[name] = {
+            table_inventory[name] = {
                 "rows": count,
                 "schema_sha256": hashlib.sha256(schema.encode("utf-8")).hexdigest(),
                 "primary_key_columns": len(pk_indices),
                 "primary_key_set_sha256": _digest_set(pk_hashes),
                 "row_set_sha256": _digest_set(row_hashes),
             }
-        return inventory
+        return {
+            "schema_objects": {
+                "count": len(schema_objects),
+                "sha256": _digest_set(schema_hashes),
+            },
+            "tables": table_inventory,
+        }
     except sqlite3.Error as exc:
         raise MigrationError("database inventory failed") from exc
     finally:
@@ -331,6 +343,21 @@ def _secret_digests(path: Path, salt: bytes) -> dict[str, str]:
     return result
 
 
+def _require_delivery_quiescence(bridge_database: Path) -> None:
+    connection = _connect_readonly(bridge_database)
+    try:
+        active = connection.execute(
+            "SELECT 1 FROM delivery_attempts "
+            "WHERE in_flight IS NULL OR in_flight != 0 LIMIT 1"
+        ).fetchone()
+    except sqlite3.Error as exc:
+        raise MigrationError("delivery fence validation failed") from exc
+    finally:
+        connection.close()
+    if active is not None:
+        raise MigrationError("delivery attempts are still in flight")
+
+
 def _prepare_destination(destination: Path) -> tuple[bool, tuple[int, int] | None]:
     try:
         mode = destination.lstat().st_mode
@@ -417,6 +444,7 @@ def clone_broker_state(
     if artifact_digest != _PINNED_ARTIFACT_TREE_SHA256:
         raise MigrationError("compatibility artifact mismatch")
 
+    _require_delivery_quiescence(source_path / "bridge.sqlite3")
     parent = destination_path.parent
     _require_directory(parent, "destination parent")
     staging = Path(tempfile.mkdtemp(prefix=f".{destination_path.name}.staging-", dir=parent))
@@ -460,24 +488,20 @@ def clone_broker_state(
             raise MigrationError("copied state validation failed") from exc
         if artifact_tree_sha256(compat_path) != artifact_digest:
             raise MigrationError("compatibility artifact changed during migration")
+        _require_delivery_quiescence(source_path / "bridge.sqlite3")
 
         # This is deliberately the final file published into the staged state.
         _atomic_json(staging / ".migration-complete.json", manifest)
         candidate_manifest.unlink()
-        directory_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            durable_tree(staging)
+        except (OSError, ValueError) as exc:
+            raise MigrationError("staged state durability failed") from exc
 
         _destination_unchanged(destination_path, existed, destination_identity)
         os.replace(staging, destination_path)
         promoted = True
-        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+        sync_directory(parent)
         return report
     except MigrationError:
         raise
