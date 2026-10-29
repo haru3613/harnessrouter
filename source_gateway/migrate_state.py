@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -10,12 +12,15 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 from typing import Any
 
 from .filesystem import durable_tree, sync_directory
 from .validation import (
     StateValidationError,
+    _hex_digest,
+    _revision,
     _validate_sqlite_sidecars,
     artifact_tree_sha256,
     validate_state,
@@ -287,10 +292,14 @@ def _copy_extra_tree(source: Path, destination: Path) -> tuple[int, str]:
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_name(path.name + ".tmp")
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    _atomic_bytes(path, payload.encode("utf-8"))
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(path.name + ".tmp")
     try:
-        with temporary.open("x", encoding="utf-8") as target:
+        with temporary.open("xb") as target:
             os.chmod(temporary, 0o600)
             target.write(payload)
             target.flush()
@@ -514,3 +523,144 @@ def clone_broker_state(
             pass
         if not promoted:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def repin_broker_state(
+    state_dir: str | os.PathLike[str],
+    compat_root: str | os.PathLike[str],
+    *,
+    expected_from_revision: str,
+    expected_from_artifact_sha256: str,
+    quiesced: bool,
+) -> dict[str, Any]:
+    """Move a validated state's source pin to a new verified compatibility artifact.
+
+    The manifest stays the single authority: only ``source_revision`` and
+    ``artifact_tree_sha256`` change. Salt, identity baselines and secret digests
+    are kept, never re-derived, so repin cannot launder modified state. The
+    previous manifest is kept byte-for-byte beside it for rollback.
+    """
+    if quiesced is not True:
+        raise MigrationError("state must be quiesced")
+    try:
+        _revision(expected_from_revision)
+        _hex_digest(expected_from_artifact_sha256, "artifact digest")
+    except StateValidationError as exc:
+        raise MigrationError("invalid expected source pin") from exc
+
+    state_path = Path(state_dir)
+    manifest_path = state_path / ".migration-complete.json"
+    try:
+        # Rows only: the currently deployed artifact is deliberately not needed.
+        validate_state(state_path)
+        original = manifest_path.read_bytes()
+        manifest = json.loads(original)
+        from_revision = _revision(manifest["source_revision"])
+        from_artifact = _hex_digest(manifest["artifact_tree_sha256"], "artifact digest")
+    except StateValidationError as exc:
+        raise MigrationError(f"current state validation failed: {exc}") from exc
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise MigrationError("unreadable migration manifest") from exc
+    # These bytes are compared again before replacement, and the repinned
+    # manifest (same baselines) is fully revalidated after it.
+    _require_delivery_quiescence(state_path / "bridge.sqlite3")
+    if not (
+        hmac.compare_digest(from_revision, expected_from_revision)
+        and hmac.compare_digest(from_artifact, expected_from_artifact_sha256)
+    ):
+        raise MigrationError("current source pin does not match expected source pin")
+
+    compat_path = Path(compat_root)
+    revision_path = compat_path / "DISPATCH_SOURCE_REVISION"
+    _require_regular(revision_path, "source revision")
+    try:
+        to_revision = _revision(revision_path.read_text(encoding="ascii").strip())
+        to_artifact = artifact_tree_sha256(compat_path)
+    except (OSError, UnicodeError) as exc:
+        raise MigrationError("invalid source revision") from exc
+    except StateValidationError as exc:
+        raise MigrationError(f"invalid compatibility artifact: {exc}") from exc
+    if to_revision == from_revision and to_artifact == from_artifact:
+        # Explicit no-op: nothing is written.
+        return {
+            "from_revision": from_revision,
+            "to_revision": to_revision,
+            "from_artifact": from_artifact,
+            "to_artifact": to_artifact,
+            "backup_manifest": None,
+            "changed": False,
+        }
+
+    backup_path = state_path / f".migration-complete.prev-{from_revision[:12]}.json"
+    repinned = dict(manifest, source_revision=to_revision, artifact_tree_sha256=to_artifact)
+    try:
+        if backup_path.exists() or backup_path.is_symlink():
+            _require_regular(backup_path, "previous manifest backup")
+            if backup_path.read_bytes() != original:
+                raise MigrationError("a different previous manifest backup already exists")
+        else:
+            _atomic_bytes(backup_path, original)
+            sync_directory(state_path)
+        _require_delivery_quiescence(state_path / "bridge.sqlite3")
+        if manifest_path.read_bytes() != original:
+            raise MigrationError("migration manifest changed during repin")
+        _atomic_json(manifest_path, repinned)
+        sync_directory(state_path)
+    except OSError as exc:
+        raise MigrationError("repin metadata write failed") from exc
+
+    try:
+        validate_state(state_path, compat_root=compat_path)
+    except (StateValidationError, OSError, sqlite3.Error) as exc:
+        try:
+            _atomic_bytes(manifest_path, original)
+            sync_directory(state_path)
+        except (MigrationError, OSError) as restore_exc:
+            raise MigrationError(
+                "repinned state validation failed and manifest restore failed; "
+                "restore the previous manifest backup manually"
+            ) from restore_exc
+        raise MigrationError("repinned state validation failed; previous manifest restored") from exc
+
+    return {
+        "from_revision": from_revision,
+        "to_revision": to_revision,
+        "from_artifact": from_artifact,
+        "to_artifact": to_artifact,
+        "backup_manifest": backup_path.name,
+        "changed": True,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """In-image operator entry: ``python -m source_gateway.migrate_state repin ...``."""
+    parser = argparse.ArgumentParser(prog="python -m source_gateway.migrate_state")
+    commands = parser.add_subparsers(dest="command", required=True)
+    repin = commands.add_parser("repin", help="move a validated state to a new pinned artifact")
+    repin.add_argument("--state", required=True)
+    repin.add_argument("--compat-root", required=True)
+    repin.add_argument("--from-revision", required=True)
+    repin.add_argument("--from-artifact-sha256", required=True)
+    repin.add_argument("--quiesced", action="store_true", help="operator has stopped source-gateway")
+    args = parser.parse_args(argv)
+    result = repin_broker_state(
+        args.state, args.compat_root,
+        expected_from_revision=args.from_revision,
+        expected_from_artifact_sha256=args.from_artifact_sha256,
+        quiesced=args.quiesced,
+    )
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = main()
+    except MigrationError as exc:
+        # Messages here are fixed invariant names; they never carry state values.
+        print(json.dumps({"error": "dispatch repin failed", "reason": str(exc)}), file=sys.stderr)
+        exit_code = 1
+    except Exception as exc:
+        print(json.dumps({"error": "dispatch repin failed", "type": type(exc).__name__}), file=sys.stderr)
+        exit_code = 1
+    raise SystemExit(exit_code)

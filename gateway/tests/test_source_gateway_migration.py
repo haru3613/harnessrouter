@@ -9,7 +9,7 @@ import pytest
 
 import source_gateway.migrate_state as migration
 from source_gateway.migrate_state import MigrationError, clone_broker_state
-from source_gateway.validation import artifact_tree_sha256, validate_state
+from source_gateway.validation import StateValidationError, artifact_tree_sha256, validate_state
 from test_source_gateway_validation import REVISION, SECRET, build_compat, build_state
 
 
@@ -342,3 +342,135 @@ def test_migration_accepts_transient_shm_without_wal(tmp_path):
     _clone(source, destination, compat)
 
     assert (destination / ".migration-complete.json").is_file()
+
+
+# --- repin -------------------------------------------------------------------
+
+NEW_RUNTIME = "def main():\n    return 'v2'\n"
+NEW_REVISION = "5d21ee3" + "0" * 33
+
+
+def _repin_setup(tmp_path):
+    old = build_compat(tmp_path)
+    state = build_migration_state(tmp_path, old)
+    new_root = tmp_path / "new"
+    new_root.mkdir()
+    new = build_compat(new_root, NEW_RUNTIME)
+    (new / "DISPATCH_SOURCE_REVISION").write_text(NEW_REVISION + "\n")
+    return old, new, state
+
+
+def _repin(state, new, old, **overrides):
+    kwargs = dict(
+        expected_from_revision=REVISION,
+        expected_from_artifact_sha256=artifact_tree_sha256(old),
+        quiesced=True,
+    )
+    kwargs.update(overrides)
+    return migration.repin_broker_state(state, new, **kwargs)
+
+
+def test_repin_moves_pin_keeps_baselines_and_backs_up_manifest(tmp_path):
+    old, new, state = _repin_setup(tmp_path)
+    manifest_path = state / ".migration-complete.json"
+    before_bytes = manifest_path.read_bytes()
+    before = json.loads(before_bytes)
+
+    result = _repin(state, new, old)
+
+    after = json.loads(manifest_path.read_text())
+    assert result["from_revision"] == REVISION and result["to_revision"] == NEW_REVISION
+    assert result["to_artifact"] == artifact_tree_sha256(new)
+    assert after.pop("source_revision") == NEW_REVISION
+    assert after.pop("artifact_tree_sha256") == artifact_tree_sha256(new)
+    before.pop("source_revision"), before.pop("artifact_tree_sha256")
+    assert after == before
+    backup = state / result["backup_manifest"]
+    assert backup.name == f".migration-complete.prev-{REVISION[:12]}.json"
+    assert backup.read_bytes() == before_bytes
+    validate_state(state, compat_root=new)
+    with pytest.raises(StateValidationError):
+        validate_state(state, compat_root=old)
+
+
+@pytest.mark.parametrize("field", ["revision", "artifact"])
+def test_repin_wrong_expected_pin_refuses_and_leaves_manifest(tmp_path, field):
+    old, new, state = _repin_setup(tmp_path)
+    manifest_path = state / ".migration-complete.json"
+    before = manifest_path.read_bytes()
+    key = "expected_from_revision" if field == "revision" else "expected_from_artifact_sha256"
+    with pytest.raises(MigrationError, match="does not match expected"):
+        _repin(state, new, old, **{key: "a" * (40 if field == "revision" else 64)})
+    assert manifest_path.read_bytes() == before
+    assert not list(state.glob(".migration-complete.prev-*"))
+
+
+def test_repin_requires_quiesced_flag(tmp_path):
+    old, new, state = _repin_setup(tmp_path)
+    before = (state / ".migration-complete.json").read_bytes()
+    with pytest.raises(MigrationError, match="quiesced"):
+        _repin(state, new, old, quiesced=False)
+    assert (state / ".migration-complete.json").read_bytes() == before
+
+
+def test_repin_refuses_inflight_delivery(tmp_path):
+    old, new, state = _repin_setup(tmp_path)
+    connection = sqlite3.connect(state / "bridge.sqlite3")
+    connection.execute("INSERT INTO delivery_attempts(in_flight) VALUES(1)")
+    connection.commit()
+    connection.close()
+    before = (state / ".migration-complete.json").read_bytes()
+    with pytest.raises(MigrationError, match="still in flight"):
+        _repin(state, new, old)
+    assert (state / ".migration-complete.json").read_bytes() == before
+
+
+def test_repin_refuses_invalid_target_revision(tmp_path):
+    old, new, state = _repin_setup(tmp_path)
+    (new / "DISPATCH_SOURCE_REVISION").write_text("not-a-revision\n")
+    before = (state / ".migration-complete.json").read_bytes()
+    with pytest.raises(MigrationError):
+        _repin(state, new, old)
+    assert (state / ".migration-complete.json").read_bytes() == before
+    assert not list(state.glob(".migration-complete.prev-*"))
+
+
+def test_repin_restores_manifest_when_post_validation_fails(tmp_path, monkeypatch):
+    old, new, state = _repin_setup(tmp_path)
+    before = (state / ".migration-complete.json").read_bytes()
+    real = migration.validate_state
+
+    def fail_with_compat(path, compat_root=None, **kw):
+        if compat_root is not None:
+            raise StateValidationError("boom")
+        return real(path, compat_root=compat_root, **kw)
+
+    monkeypatch.setattr(migration, "validate_state", fail_with_compat)
+    with pytest.raises(MigrationError, match="previous manifest restored"):
+        _repin(state, new, old)
+    assert (state / ".migration-complete.json").read_bytes() == before
+    validate_state(state, compat_root=old)
+
+
+def test_repin_to_same_target_is_a_noop(tmp_path):
+    old, new, state = _repin_setup(tmp_path)
+    _repin(state, new, old)
+    current = (state / ".migration-complete.json").read_bytes()
+    result = _repin(
+        state, new, old,
+        expected_from_revision=NEW_REVISION,
+        expected_from_artifact_sha256=artifact_tree_sha256(new),
+    )
+    assert result["changed"] is False and result["backup_manifest"] is None
+    assert (state / ".migration-complete.json").read_bytes() == current
+
+
+def test_repin_cli_module_entry(tmp_path, capsys):
+    old, new, state = _repin_setup(tmp_path)
+    code = migration.main([
+        "repin", "--state", str(state), "--compat-root", str(new),
+        "--from-revision", REVISION, "--from-artifact-sha256", artifact_tree_sha256(old),
+        "--quiesced",
+    ])
+    assert code == 0
+    assert json.loads(capsys.readouterr().out)["to_revision"] == NEW_REVISION

@@ -22,8 +22,20 @@ def main():
         command.add_argument("--quiesced", action="store_true", help="operator has fenced all old writers")
     broker.add_argument("--compat-root", required=True)
     broker.add_argument("--source-revision", required=True)
+    repin = commands.add_parser("repin", help="move validated broker state to a new pinned artifact")
+    repin.add_argument("--state", required=True)
+    repin.add_argument("--compat-root", required=True)
+    repin.add_argument("--from-revision", required=True)
+    repin.add_argument("--from-artifact-sha256", required=True)
+    repin.add_argument("--quiesced", action="store_true", help="operator has stopped source-gateway")
     args = parser.parse_args()
-    if args.command == "broker":
+    if args.command == "repin":
+        from source_gateway.migrate_state import repin_broker_state
+        result = repin_broker_state(args.state, args.compat_root,
+                                    expected_from_revision=args.from_revision,
+                                    expected_from_artifact_sha256=args.from_artifact_sha256,
+                                    quiesced=args.quiesced)
+    elif args.command == "broker":
         from source_gateway.migrate_state import clone_broker_state
         result = clone_broker_state(args.source, args.destination, args.compat_root,
                                     args.source_revision, quiesced=args.quiesced)
