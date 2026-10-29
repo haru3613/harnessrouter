@@ -74,6 +74,40 @@ can restore the stopped stack and matching snapshot under the same fence.
 After connector start, recovery is forward repair only; do not restore the old state snapshot over accepted tasks. Every
 pre-traffic rollback restores matching code, config and Compose commands together.
 
+## Upgrading the pinned dispatch source
+
+The state manifest (`/state/current/.migration-complete.json`) is the single
+authority for which private dispatch artifact the state belongs to; the gateway
+refuses to start when its image's `/app/compat` revision or tree hash differs.
+To move to a new revision:
+
+1. Build the new private artifact and the new source-gateway image from it.
+   Record the current `source_revision` and `artifact_tree_sha256` from the
+   manifest (these are not secrets).
+2. Stop source-gateway (and anything else writing the state volume), and wait
+   for zero in-flight delivery attempts.
+3. Repin offline with the NEW image:
+
+   ```bash
+   docker compose run --rm --no-deps --entrypoint python source-gateway \
+     -m source_gateway.migrate_state repin --state /state/current \
+     --compat-root /app/compat --from-revision <old 40-hex revision> \
+     --from-artifact-sha256 <old tree sha256> --quiesced
+   ```
+
+   It validates the state rows, requires the manifest to equal the expected
+   `--from-*` pin, changes only `source_revision` and `artifact_tree_sha256` to
+   the image's `/app/compat` values, keeps salt, baselines and secret digests,
+   saves the old manifest as `.migration-complete.prev-<old-rev12>.json`,
+   revalidates against the new artifact and restores the old manifest if that
+   fails. Repeating it for the same target is a reported no-op.
+   (`scripts/migrate-dispatch-state.py repin` takes the same flags.)
+4. Start source-gateway on the new image and verify health.
+
+Rollback: stop source-gateway, then either run `repin` again with the old image
+(expected-from = the new pin) or copy the `.prev-*.json` file over
+`.migration-complete.json`, and start the old image.
+
 ## Acceptance
 
 Unit/HTTP checks cover disabled defaults, startup failure, source-gateway listener and
